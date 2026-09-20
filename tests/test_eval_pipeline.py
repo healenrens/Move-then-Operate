@@ -160,7 +160,7 @@ def generate_episode_descriptions(task, episodes, count):
                 params_path=str(root / "unused_params"), run_config=str(root / "resolved_config.json"),
                 move_norm_stats_path=str(root / "move.json"), operate_norm_stats_path=str(root / "operate.json"),
                 tokenizer_path=str(root / "unused_tokenizer"), run_id="resume", output_root=str(root / "results"),
-                task_list=None, manifest=None, task_configs=["demo_clean"], test_num=2, seed=0, start_seed=10,
+                task_list=None, manifest=None, task_catalog=None, task_configs=["demo_clean"], test_num=2, seed=0, start_seed=10,
                 instruction_type="unseen", deterministic_instruction=True, exec_steps=2, num_steps=10,
                 max_seed_attempts=2, video=False, model_gpus="", sim_gpus="", server_host="127.0.0.1",
                 server_port=port, startup_timeout=20,
@@ -197,6 +197,14 @@ def generate_episode_descriptions(task, episodes, count):
                 self.assertEqual(eval_robotwin.records(directory / "worker_runs")[0]["exit_code"], 0)
                 self.assertEqual(eval_robotwin.records(directory / "attempts")[0]["status"], "skipped")
                 original_episode = (directory / "episodes/seed_11.json").read_bytes()
+                # The installed 8600 environment uses task_config/ rather than
+                # env_cfg/task_config/. Its CONFIGS_PATH is authoritative.
+                legacy_configs = robotwin / "task_config"
+                configs.rename(legacy_configs)
+                _write(robotwin / "envs/__init__.py", f"CONFIGS_PATH = {str(legacy_configs) + '/'!r}\n")
+                explicit_catalog = root / "task_catalog.yml"
+                (robotwin / "env_cfg/eval/all_tasks.yml").rename(explicit_catalog)
+                args.task_catalog = str(explicit_catalog)
                 args.max_seed_attempts = 3
                 eval_robotwin.run_controller(args)
                 self.assertEqual((directory / "episodes/seed_11.json").read_bytes(), original_episode)
@@ -216,6 +224,15 @@ def generate_episode_descriptions(task, episodes, count):
                 crash_dir = root / "results/native_crash/demo_clean/fake_task"
                 self.assertEqual(eval_robotwin.records(crash_dir / "episodes"), [])
                 self.assertEqual([item["exit_code"] for item in eval_robotwin.records(crash_dir / "worker_runs")], [1, 9])
+
+            # Missing default catalogs provide an actionable task-selection hint
+            # without starting a server or inventing a task list.
+            args.task_catalog = None
+            with mock.patch.object(subprocess, "run", side_effect=run), \
+                    contextlib.redirect_stdout(io.StringIO()) as message:
+                eval_robotwin.run_controller(args)
+            self.assertIn("--manifest", message.getvalue())
+            self.assertIn("--task-catalog", message.getvalue())
 
             episodes = {item["seed"]: item for item in eval_robotwin.records(directory / "episodes")}
             self.assertEqual((episodes[11]["termination"], episodes[11]["steps"]), ("success", 1))

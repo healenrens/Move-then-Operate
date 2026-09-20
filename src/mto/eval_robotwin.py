@@ -42,13 +42,13 @@ def load_environment_args(root: Path, task: str, setting: str) -> dict:
     import yaml
     from envs import CONFIGS_PATH
 
-    config_dir = root / "env_cfg" / "task_config"
+    config_dir = Path(CONFIGS_PATH)
     args = yaml.safe_load((config_dir / f"{setting}.yml").read_text())
     args.update(task_name=task, task_config=setting, policy_name="mto_robotwin", eval_mode=True)
     args["data_type"].update(rgb=True, qpos=True)
     args["camera"].update(collect_head_camera=True, collect_wrist_camera=True)
-    embodiments = yaml.safe_load((Path(CONFIGS_PATH) / "_embodiment_config.yml").read_text())
-    cameras = yaml.safe_load((Path(CONFIGS_PATH) / "_camera_config.yml").read_text())
+    embodiments = yaml.safe_load((config_dir / "_embodiment_config.yml").read_text())
+    cameras = yaml.safe_load((config_dir / "_camera_config.yml").read_text())
     head = cameras[args["camera"]["head_camera_type"]]
     args.update(head_camera_h=head["h"], head_camera_w=head["w"])
     names = args["embodiment"]
@@ -250,9 +250,14 @@ def run_controller(args) -> None:
         tasks = manifest["selected_tasks"] if "selected_tasks" in manifest else manifest["tasks"]
     else:
         # Read the actual installed RoboTwin task catalog using its own YAML dependency.
+        catalog_path = Path(args.task_catalog) if args.task_catalog else root / "env_cfg" / "eval" / "all_tasks.yml"
+        if not catalog_path.is_file():
+            print(f"Task catalog does not exist: {catalog_path}. Supply --manifest with the training data_manifest.json, "
+                  "--task-list with one task per line, or --task-catalog with a YAML tasks list.")
+            return
         catalog = subprocess.check_output([
             args.robotwin_py, "-c", "import json,sys,yaml; print(json.dumps(yaml.safe_load(open(sys.argv[1]))['tasks']))",
-            str(root / "env_cfg" / "eval" / "all_tasks.yml"),
+            str(catalog_path),
         ], text=True)
         tasks = json.loads(catalog)
     tasks = list(dict.fromkeys(tasks))
@@ -394,6 +399,7 @@ def parse_args():
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument("--task-list", help="One task name per line; default: RoboTwin's all_tasks.yml catalog")
     selection.add_argument("--manifest", help="MTO dataset manifest selected_tasks, or explicit JSON tasks list")
+    selection.add_argument("--task-catalog", help="YAML with a tasks list; default: ROBOTWIN_ROOT/env_cfg/eval/all_tasks.yml")
     parser.add_argument("--task-configs", nargs="+", default=["demo_clean"])
     parser.add_argument("--test-num", type=int, default=100)
     parser.add_argument("--seed", type=int, default=0)

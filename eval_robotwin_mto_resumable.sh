@@ -8,6 +8,8 @@ if [[ -n "${TASK_LIST:-}" ]]; then
   selection=(--task-list "$TASK_LIST")
 elif [[ -n "${TASK_MANIFEST:-}" ]]; then
   selection=(--manifest "$TASK_MANIFEST")
+elif [[ -n "${TASK_CATALOG:-}" ]]; then
+  selection=(--task-catalog "$TASK_CATALOG")
 fi
 
 export PYTHONPATH="$MTO_DIR/src${PYTHONPATH:+:$PYTHONPATH}"

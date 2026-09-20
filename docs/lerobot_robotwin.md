@@ -21,7 +21,7 @@ export MTO_PY="$MTO_DIR/.venv/bin/python"
 export DATA_ROOT=/mnt/pfs/public/fanyupeng/dataset/robotwin2_lerobot
 export LABELS_ROOT=/mnt/pfs/public/xuhaoming/mto_artifacts/labels
 export RUN_ROOT=/mnt/pfs/public/xuhaoming/mto_artifacts
-export PI0_PARAMS=/ABS/PATH/TO/pi0_base/params
+export PI0_PARAMS=/mnt/pfs/public/xuhaoming/mto_artifacts/base_assets/openpi-assets/checkpoints/pi0_base/params
 export TOKENIZER=/root/.cache/openpi/big_vision/paligemma_tokenizer.model
 cd "$MTO_DIR"
 ```
@@ -30,13 +30,13 @@ cd "$MTO_DIR"
 
 ## Label all tasks
 
-Omit `--task_names` to include every task (the intended collection has 50). Both splits are selected explicitly here. For clean-only training, use only `demo_clean` consistently in labeling, statistics, and training.
+Omit `--task_names` to include every task (the intended collection has 50). The first run uses **all 50 tasks, clean training only**. Labeling, statistics, and training all explicitly select `demo_clean`. Keep randomized evaluation separate from the training split.
 
 ```bash
 "$MTO_PY" -m mto.auto_label \
   --data_format lerobot_v3 --root_dir "$DATA_ROOT" \
   --labels_root "$LABELS_ROOT" \
-  --split_names demo_clean demo_randomized \
+  --split_names demo_clean \
   --camera_key observation.images.cam_high \
   --sample_fps 5 --max_frames 64 --concurrency 5 --max_attempts 3
 ```
@@ -46,10 +46,10 @@ The API key is supplied through `ARK_API_KEY`; annotation calls the configured e
 ## Compute two expert statistics
 
 ```bash
-export NORM_DIR="$RUN_ROOT/norm/all_tasks_both_splits_h30"
+export NORM_DIR="$RUN_ROOT/norm/all_tasks_clean_h30"
 "$MTO_PY" -m mto.compute_norm_stats \
   --data-format lerobot_v3 --data-root "$DATA_ROOT" \
-  --labels-root "$LABELS_ROOT" --split-names demo_clean demo_randomized \
+  --labels-root "$LABELS_ROOT" --split-names demo_clean \
   --action-horizon 30 --normalize-method zscore \
   --num-samples-per-expert 50000 --seed 42 --output-dir "$NORM_DIR"
 ```
@@ -62,8 +62,8 @@ This produces **different** `move.json` and `operate.json` statistics plus `data
 CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_PREALLOCATE=false \
 "$MTO_PY" -m mto.train \
   --data-format lerobot_v3 --data-root "$DATA_ROOT" \
-  --labels-root "$LABELS_ROOT" --split-names demo_clean demo_randomized \
-  --exp-name mto_all_tasks_h30_lora --checkpoint-base-dir "$RUN_ROOT/checkpoints" \
+  --labels-root "$LABELS_ROOT" --split-names demo_clean \
+  --exp-name mto_all_tasks_clean_h30_lora --checkpoint-base-dir "$RUN_ROOT/checkpoints" \
   --init-params "$PI0_PARAMS" --init-source pi0_base --tokenizer-path "$TOKENIZER" \
   --training-mode lora --action-horizon 30 --model-action-dim 32 \
   --batch-size 8 --num-workers 4 --num-steps 10000 \
@@ -81,7 +81,7 @@ Batch 8 is a starting configuration; VRAM feasibility has not been measured on t
 The run directory contains:
 
 ```text
-checkpoints/wide_camera_dual_expert/mto_all_tasks_h30_lora/
+checkpoints/wide_camera_dual_expert/mto_all_tasks_clean_h30_lora/
   resolved_config.json
   data_manifest.json
   assets/move.json
@@ -95,7 +95,7 @@ The manifests record actual episode/phase inclusion and omissions. Statistics ar
 ## Serve a trained checkpoint
 
 ```bash
-export TRAIN_RUN="$RUN_ROOT/checkpoints/wide_camera_dual_expert/mto_all_tasks_h30_lora"
+export TRAIN_RUN="$RUN_ROOT/checkpoints/wide_camera_dual_expert/mto_all_tasks_clean_h30_lora"
 export PARAMS="$TRAIN_RUN/10000/params"
 CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_PREALLOCATE=false \
 "$MTO_PY" -m mto.infer \
@@ -112,13 +112,13 @@ The adapter sends three current RGB images, the raw 14D joint drive-target state
 
 ## MTO-owned RoboTwin evaluation
 
-`mto.eval_robotwin` implements the evaluation loop itself; it does not call RoboTwin's legacy or XPolicyLab evaluation runner. The environment API was aligned to [RoboTwin main at 6dde571](https://github.com/RoboTwin-Platform/RoboTwin/blob/6dde57155eafa3e4ebf6ad1f93a7cf7d5d41a755/scripts/eval_policy_xpolicylab.py). It loads current `env_cfg/task_config` configuration, screens scene seeds with the environment expert, then resets the same accepted scene for the MTO policy. The official environment still determines task success and action budgets.
+`mto.eval_robotwin` implements the evaluation loop itself; it does not call RoboTwin's legacy or XPolicyLab evaluation runner. The environment API was aligned to [RoboTwin main at 6dde571](https://github.com/RoboTwin-Platform/RoboTwin/blob/6dde57155eafa3e4ebf6ad1f93a7cf7d5d41a755/scripts/eval_policy_xpolicylab.py). It uses the installed environment's `envs.CONFIGS_PATH` for task, embodiment and camera configuration (including both `task_config/` and `env_cfg/task_config/` layouts), screens scene seeds with the environment expert, then resets the same accepted scene for the MTO policy. The official environment still determines task success and action budgets.
 
 Stop any manually started service from the previous example before using this wrapper, which manages its own service:
 
 ```bash
-export ROBOTWIN_ROOT=/ABS/PATH/TO/RoboTwin
-export ROBOTWIN_PY=/ABS/PATH/TO/robotwin-venv/bin/python
+export ROBOTWIN_ROOT=/root/xuhaoming/xr-2/RoboTwin
+export ROBOTWIN_PY=/root/xuhaoming/xr-2/.venv/bin/python
 export PARAMS_PATH="$TRAIN_RUN/10000/params"
 export RUN_CONFIG="$TRAIN_RUN/resolved_config.json"
 export MOVE_NORM_STATS_PATH="$TRAIN_RUN/assets/move.json"
@@ -127,16 +127,16 @@ export TOKENIZER_PATH="$TOKENIZER"
 export TASK_MANIFEST="$TRAIN_RUN/data_manifest.json"
 export EVAL_ROOT="$RUN_ROOT/eval"
 
-RUN_ID=mto_all_tasks10k_clean TEST_NUM=100 EXEC_STEPS=30 \
+RUN_ID=mto_clean10k_eval_clean TEST_NUM=100 EXEC_STEPS=30 \
 TASK_CONFIGS=demo_clean MODEL_GPUS=0 SIM_GPUS=0 SERVER_PORT_BASE=9700 \
 bash "$MTO_DIR/eval_robotwin_mto_resumable.sh"
 
-RUN_ID=mto_all_tasks10k_random TEST_NUM=100 EXEC_STEPS=30 \
+RUN_ID=mto_clean10k_eval_random TEST_NUM=100 EXEC_STEPS=30 \
 TASK_CONFIGS=demo_randomized MODEL_GPUS=0 SIM_GPUS=0 SERVER_PORT_BASE=9800 \
 bash "$MTO_DIR/eval_robotwin_mto_resumable.sh"
 ```
 
-`TASK_MANIFEST` uses the selected training task list. With neither `TASK_MANIFEST` nor `TASK_LIST`, the wrapper reads the installed RoboTwin `env_cfg/eval/all_tasks.yml` catalog (currently 50 tasks). `TASK_LIST` can instead name a local text file with one task per line. A single GPU is used sequentially by default. Simulator and model GPU visibility can be configured separately.
+`TASK_MANIFEST` uses the selected training task list. Use `TASK_MANIFEST` on 8600, where the newer `env_cfg/eval/all_tasks.yml` catalog is absent. `TASK_LIST` can instead name a local text file with one task per line, or `TASK_CATALOG` a YAML file containing a `tasks` list (CLI: `--task-catalog`). With no explicit selection the newer default catalog is used if present; otherwise the command prints the available selection options. `TASK_CONFIGS` remains a setting name such as `demo_clean`, not a filesystem path. A single GPU is used sequentially by default. Simulator and model GPU visibility can be configured separately.
 
 Repeat the same command and `RUN_ID` to resume. Each task records candidate seeds, accepted completed episodes, environment/model errors, action/route traces and videos. Only success or action-budget termination counts as a completed trial. Scene-selection errors skip that candidate as in the reference environment workflow; an error during policy rollout leaves the trial missing and stops that task until a later retry. A bounded candidate-seed budget prevents endlessly searching an unsatisfiable task. Summary SR is successes divided by completed trials, with requested totals and missing tasks reported separately. Clean and Random summaries remain separate. A partial result is never described as a complete 50×100 evaluation.
 
@@ -146,11 +146,11 @@ The model is reset using the actual accepted environment seed, rather than the t
 
 ## Validation scope
 
-Local integration tests use synthetic Parquet/video data and a stub policy/environment for the transport/runner path. Run the bounded checks with:
+Local integration tests cover synthetic Parquet/video data, CPU checkpoint save/restore/continue with and without EMA, and a stub policy/environment for the transport/runner path. Run the bounded checks with:
 
 ```bash
 cd "$MTO_DIR"
 "$MTO_PY" -m unittest discover -s tests
 ```
 
-They do not establish real AV1 corpus alignment, GPU memory use, convergence, saved-model correctness, SAPIEN execution, or benchmark SR. Remote acceptance still needs one group of real-data training steps, save/resume/export, a fresh-process checkpoint load, and complete single-task RoboTwin episodes before scaling to all tasks. Offline router accuracy and action loss are training diagnostics, not closed-loop success rates.
+These local checks do not establish full-model GPU restoration or SAPIEN execution. On 8600, continue the existing validation checkpoint from step 2 to step 3, load the new checkpoint in a fresh inference process, and complete a single-task RoboTwin episode before scaling to all tasks. Keep engineering test labels separate from the semantic annotations used for formal training. Offline router accuracy and action loss are training diagnostics, not closed-loop success rates.

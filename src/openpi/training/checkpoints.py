@@ -5,6 +5,7 @@ import logging
 
 from etils import epath
 import flax.nnx as nnx
+import jax
 import orbax.checkpoint as ocp
 
 from openpi.shared import array_typing as at
@@ -72,12 +73,12 @@ def restore_state(
     step: int | None = None,
 ) -> training_utils.TrainState:
     with at.disable_typechecking():
-        train_state, params = _split_params(state, to_pure_dict=False)
+        train_state, params = _split_params(state, to_pure_dict=True)
         restored = checkpoint_manager.restore(
             step,
             items={"train_state": train_state, "params": {"params": params}},
         )
-    return _merge_params(restored["train_state"], restored["params"])
+    return _merge_params(restored["train_state"], restored["params"], template=state)
 
 
 def _split_params(
@@ -96,11 +97,24 @@ def _split_params(
     return train_state, params
 
 
-def _merge_params(train_state: training_utils.TrainState, params: dict[str, at.Params]) -> training_utils.TrainState:
-    # Revert the logic inside `_split_params`. Assumes that existence of `params` means that EMA params were used during the split.
-    restored = params["params"]
-    if not isinstance(restored, nnx.State):
-        restored = nnx.State(restored)
-    if train_state.params:
+def _merge_params(
+    train_state: training_utils.TrainState,
+    params: dict[str, at.Params],
+    *,
+    template: training_utils.TrainState,
+) -> training_utils.TrainState:
+    reference = template.ema_params if template.ema_params is not None else template.params
+    pure = params["params"]
+    at.check_pytree_equality(
+        expected=reference.to_pure_dict(),
+        got=pure,
+        check_shapes=True,
+        check_dtypes=True,
+    )
+    # Copy the NNX structure before replacing values so Param types and metadata
+    # survive restoration without mutating the caller's initialization template.
+    restored = jax.tree.map(lambda value: value, reference)
+    restored.replace_by_pure_dict(pure)
+    if template.ema_params is not None:
         return dataclasses.replace(train_state, ema_params=restored)
     return dataclasses.replace(train_state, params=restored)
