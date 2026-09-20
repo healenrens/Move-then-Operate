@@ -54,13 +54,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--task_names", nargs="*", default=())
     parser.add_argument("--split_names", nargs="*", default=())
     parser.add_argument("--camera_key", help="Defaults to observation.images.cam_high for LeRobot, head_camera for standalone videos.")
-    parser.add_argument("--model_id", default="doubao-seed-1-6-thinking-250715")
+    parser.add_argument("--model_id", default="ep-20260605100618-g5rhc")
     parser.add_argument("--api_key", help="Defaults to the ARK_API_KEY environment variable.")
     parser.add_argument("--base_url", default="https://ark.cn-beijing.volces.com/api/v3")
     parser.add_argument("--sample_fps", type=float, default=5.0)
     parser.add_argument("--max_frames", type=int, default=64)
     parser.add_argument("--videos_limit", type=int, default=-1)
-    parser.add_argument("--max_new_tokens", type=int, default=2048)
+    parser.add_argument("--max_new_tokens", type=int, default=8192,
+                        help="Responses max_output_tokens, including thinking and final label JSON.")
     parser.add_argument("--concurrency", type=int, default=5)
     parser.add_argument("--max_attempts", type=int, default=3, help="Total API attempts per episode, including malformed responses.")
     parser.add_argument("--no_resume", dest="resume", action="store_false")
@@ -225,24 +226,22 @@ def build_messages(
         "- Output JSON array only (no commentary, no markdown).\n"
     )
 
-    content: List[Dict[str, object]] = [{"type": "text", "text": "Frame indices: " + frame_list_text}]
-    content.append({"type": "text", "text": prompt})
+    content: List[Dict[str, object]] = [{"type": "input_text", "text": "Frame indices: " + frame_list_text}]
+    content.append({"type": "input_text", "text": prompt})
     for idx, image in samples:
-        content.append({"type": "text", "text": f"frame_idx={idx}"})
+        content.append({"type": "input_text", "text": f"frame_idx={idx}"})
         content.append(
             {
-                "type": "image_url",
-                "image_url": {
-                    "url": to_data_url(image),
-                },
+                "type": "input_image",
+                "image_url": to_data_url(image),
             }
         )
-    content.append({"type": "text", "text": prompt})
+    content.append({"type": "input_text", "text": prompt})
     return [
         {
             "role": "system",
             "content": [
-                {"type": "text", "text": "You output only valid JSON following the requested schema."}
+                {"type": "input_text", "text": "You output only valid JSON following the requested schema."}
             ],
         },
         {
@@ -273,7 +272,7 @@ def compose_messages_with_feedback(
               "4) Do not invent a move phase in a pure-operate episode. "
               "Return JSON array only."
         )
-        messages[-1]["content"].append({"type": "text", "text": guidance})
+        messages[-1]["content"].append({"type": "input_text", "text": guidance})
     return messages
 
 
@@ -287,22 +286,14 @@ def run_inference(
     messages: List[Dict[str, object]],
     max_new_tokens: int,
 ) -> str:
-    response = client.chat.completions.create(
+    response = client.responses.create(
         model=model_id,
-        messages=messages,
-        max_tokens=max_new_tokens,
+        input=messages,
+        max_output_tokens=max_new_tokens,
         temperature=0.0,
     )
-    choice = response.choices[0]
-    content = choice.message.content
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        text_parts = [part["text"] for part in content if part.get("type") == "text"]
-        if not text_parts:
-            raise ValueError("Model returned empty content list.")
-        return "".join(text_parts)
-    raise ValueError("Unsupported response content type.")
+    # The SDK concatenates output_text message parts and excludes reasoning.
+    return response.output_text
 
 
 def extract_json_array(text: str) -> List[Dict[str, object]]:
@@ -394,7 +385,8 @@ def build_metadata(args: argparse.Namespace, relative_id: str, episode_index: in
         "instruction": instruction,
         "frame_space": "episode_local",
         "end_convention": "inclusive",
-        "model": {"id": args.model_id, "base_url": args.base_url, "max_new_tokens": args.max_new_tokens},
+        "model": {"id": args.model_id, "base_url": args.base_url, "api": "responses",
+                  "max_new_tokens": args.max_new_tokens},
         "sampling": {"method": "uniform_full_episode", "sample_fps": args.sample_fps,
                      "max_frames": args.max_frames, "frame_indices": indices},
         "source": source,

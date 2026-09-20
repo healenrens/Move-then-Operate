@@ -900,7 +900,7 @@ requires-dist = [
     { name = "ml-dtypes", specifier = "==0.4.1" },
     { name = "msgpack", specifier = ">=1.0.5,<2" },
     { name = "numpy", specifier = "==1.26.4" },
-    { name = "openai", specifier = ">=1.65,<2" },
+    { name = "openai", specifier = ">=1.109.1,<2" },
     { name = "opencv-python-headless", specifier = "==4.11.0.86" },
     { name = "optax", specifier = "==0.2.4" },
     { name = "orbax-checkpoint", specifier = "==0.11.13" },

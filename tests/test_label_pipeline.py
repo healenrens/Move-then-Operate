@@ -12,7 +12,7 @@ import unittest
 from unittest.mock import patch
 
 import httpx
-from openai import APIConnectionError
+from openai import OpenAI
 from PIL import Image
 
 from mto import auto_label
@@ -69,19 +69,56 @@ class LabelPipelineTest(unittest.TestCase):
                                                  "Pick up the bottle.", {"dataset_root": str(dataset)})
             job = auto_label.AnnotationJob(output, metadata, indices, video_path="mock.mp4")
             frame = Image.new("RGB", (8, 8))
-            connection_error = APIConnectionError(request=httpx.Request("POST", "http://localhost"))
+            requests = []
+
+            def responses_endpoint(request):
+                self.assertEqual(request.method, "POST")
+                self.assertEqual(request.url.path, "/responses")
+                body = json.loads(request.content)
+                requests.append(body)
+                self.assertEqual(body["model"], args.model_id)
+                self.assertEqual(body["max_output_tokens"], args.max_new_tokens)
+                self.assertNotIn("messages", body)
+                self.assertNotIn("max_tokens", body)
+                for message in body["input"]:
+                    self.assertTrue(all(part["type"] in ("input_text", "input_image")
+                                        for part in message["content"]))
+                user_content = body["input"][-1]["content"]
+                images = [part for part in user_content if part["type"] == "input_image"]
+                self.assertEqual(len(images), len(indices))
+                self.assertTrue(all(part["image_url"].startswith("data:image/jpeg;base64,") for part in images))
+                indexed_text = [part["text"] for part in user_content
+                                if part["type"] == "input_text" and part["text"].startswith("frame_idx=")]
+                self.assertEqual(indexed_text, [f"frame_idx={index}" for index in indices])
+                if len(requests) == 1:
+                    return httpx.Response(429, json={"error": {"message": "fixture rate limit", "type": "rate_limit"}})
+                self.assertIn("Previous attempt issues", user_content[-1]["text"])
+                text = "[invalid JSON]" if len(requests) == 2 else json.dumps(labels)
+                midpoint = len(text) // 2
+                return httpx.Response(200, json={
+                    "id": "resp_fixture", "object": "response", "created_at": 0,
+                    "model": args.model_id, "status": "completed", "output": [
+                        {"type": "reasoning", "id": "reasoning_fixture", "summary": [
+                            {"type": "summary_text", "text": "This reasoning is not label JSON."}]},
+                        {"type": "message", "id": "message_fixture", "role": "assistant", "status": "completed",
+                         "content": [{"type": "output_text", "text": fragment, "annotations": []}
+                                     for fragment in (text[:midpoint], text[midpoint:])]},
+                    ],
+                })
+
+            client = OpenAI(api_key="mock-key", base_url=args.base_url, max_retries=0,
+                            http_client=httpx.Client(transport=httpx.MockTransport(responses_endpoint)))
             with patch.object(auto_label, "read_frame_at", side_effect=lambda _, index: (index, frame)), \
-                    patch.object(auto_label, "run_inference",
-                                 side_effect=[connection_error, "[invalid JSON]", json.dumps(labels)]) as infer, \
-                    redirect_stdout(io.StringIO()):
-                result = auto_label.process_job(object(), args, job, None)
-            self.assertEqual((result["status"], infer.call_count), ("annotated", 3))
+                    client, redirect_stdout(io.StringIO()):
+                result = auto_label.process_job(client, args, job, None)
+            self.assertEqual((result["status"], len(requests)), ("annotated", 3))
             self.assertEqual(load_phase_labels(output, 720), (labels, None))
             self.assertIsNone(auto_label.existing_label_error(job))
             meta_path = label_metadata_path(output)
             saved_meta = json.loads(meta_path.read_text())
             self.assertEqual(saved_meta["attempts"], 3)
-            for field in ("relative_id", "episode_index", "length", "fps", "camera", "instruction", "sampling", "source"):
+            self.assertEqual(saved_meta["model"]["api"], "responses")
+            for field in ("relative_id", "episode_index", "length", "fps", "camera", "instruction", "sampling", "source", "model"):
                 mismatch = deepcopy(saved_meta)
                 mismatch[field] = "different"
                 meta_path.write_text(json.dumps(mismatch))

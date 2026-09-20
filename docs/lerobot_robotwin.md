@@ -37,11 +37,15 @@ Omit `--task_names` to include every task (the intended collection has 50). The 
   --data_format lerobot_v3 --root_dir "$DATA_ROOT" \
   --labels_root "$LABELS_ROOT" \
   --split_names demo_clean \
+  --model_id ep-20260605100618-g5rhc \
   --camera_key observation.images.cam_high \
-  --sample_fps 5 --max_frames 64 --concurrency 5 --max_attempts 3
+  --sample_fps 5 --max_frames 64 --max_new_tokens 8192 \
+  --concurrency 5 --max_attempts 3
 ```
 
-The API key is supplied through `ARK_API_KEY`; annotation calls the configured external model. Set `--model_id` to your available endpoint if needed. Existing valid annotations with matching sidecars are resumed. If your annotations are already complete, proceed directly to statistics; the training reader records missing/invalid labels.
+The API key is supplied through `ARK_API_KEY`. Annotation uses the OpenAI SDK's `client.responses.create` against `https://ark.cn-beijing.volces.com/api/v3`, with endpoint `ep-20260605100618-g5rhc` by default. Frame indices use `input_text`, and frames use JPEG data URLs in `input_image`; only the response's final `output_text` becomes label JSON. This follows the [Ark Responses interface](https://www.volcengine.com/docs/82379/1795150). `--max_new_tokens` maps to `max_output_tokens` and includes thinking plus final output; its default is 8192. The locked environment already includes a compatible SDK, so use `uv sync --extra cuda12 --frozen` after updating the checkout instead of upgrading the SDK independently.
+
+Existing valid annotations with matching sidecars are resumed. The sidecar records the API type, model endpoint and token limit; labels from a different request configuration are archived and regenerated. If your annotations are already complete, proceed directly to statistics; the training reader records missing/invalid labels.
 
 ## Compute two expert statistics
 
