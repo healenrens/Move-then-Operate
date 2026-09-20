@@ -7,6 +7,8 @@ requires-python = ">=3.11,<3.12"
 license = { file = "LICENSE" }
 dependencies = [
     "augmax==0.4.1",
+    "av>=14,<17",
+    "pyarrow>=19,<24",
     "beartype==0.19.0",
     "einops==0.8.1",
     "etils[epath]==1.12.2",

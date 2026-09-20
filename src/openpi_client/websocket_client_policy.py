@@ -51,5 +51,10 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
         return msgpack_numpy.unpackb(response)
 
     @override
-    def reset(self) -> None:
-        pass
+    def reset(self, seed: int | None = None) -> None:
+        self._ws.send(self._packer.pack({"method": "reset", "seed": seed}))
+        response = msgpack_numpy.unpackb(self._ws.recv())
+        assert response["ok"]
+
+    def close(self) -> None:
+        self._ws.close()

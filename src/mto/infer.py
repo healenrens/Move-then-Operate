@@ -7,6 +7,7 @@ The checkpoint path must point to the params directory, not its parent step.
 """
 
 import dataclasses
+import time
 from typing import Literal
 
 import numpy as np
@@ -33,6 +34,8 @@ class Args:
     normalize_method: Literal["zscore", "min_max"] = "zscore"
     num_steps: int = 10
     seed: int = 0
+    warmup: bool = True
+    service_id: str | None = None
     # Local NPZ input. Omit to start the WebSocket server.
     observation_path: str | None = None
     output_path: str = "mto_actions.npz"
@@ -60,7 +63,11 @@ def main(args: Args) -> None:
         seed=args.seed,
     )
     if args.observation_path is None:
-        WebsocketPolicyServer(policy, host=args.host, port=args.port, metadata=policy.metadata).serve_forever()
+        if args.warmup:
+            start = time.monotonic()
+            policy.warmup()
+            print(f"Compiled both expert decoders in {time.monotonic() - start:.2f}s", flush=True)
+        WebsocketPolicyServer(policy, host=args.host, port=args.port, metadata={**policy.metadata, "service_id": args.service_id}).serve_forever()
     else:
         with np.load(args.observation_path) as sample:
             observation = {

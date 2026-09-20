@@ -1,16 +1,28 @@
+"""Annotate standalone robot videos or LeRobot v3 episodes with phase labels."""
+
+from __future__ import annotations
+
 import argparse
 import base64
-import json
-import os
-import random
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from copy import deepcopy
+from copy import copy, deepcopy
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from datetime import datetime, timezone
+import json
+import math
+import os
+from pathlib import Path
+from typing import TYPE_CHECKING, Dict, List, Tuple
 
 import cv2
+from openai import APIConnectionError, APIStatusError, OpenAI
 from PIL import Image
-from openai import OpenAI
+
+from mto.labels import label_metadata_path, label_path, load_phase_labels, validate_phase_labels
+
+if TYPE_CHECKING:
+    from mto.lerobot_reader import EpisodeRef, LeRobotReader
 
 
 @dataclass
@@ -20,117 +32,77 @@ class VideoSample:
     output_path: str
 
 
+@dataclass
+class AnnotationJob:
+    output_path: Path
+    metadata: dict
+    frame_indices: list[int]
+    video_path: str | None = None
+    episode: EpisodeRef | None = None
+
+    @property
+    def identity(self) -> str:
+        return f"{self.metadata['relative_id']}/episode{self.metadata['episode_index']}"
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Auto label robot videos via Doubao vision model with phase-aware subtasks."
-    )
-    parser.add_argument("--root_dir", type=str, required=True)
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default=None,
-        help="Defaults to <root_dir>/auto_labels_v2.",
-    )
-    parser.add_argument(
-        "--model_id",
-        type=str,
-        default="doubao-seed-1-6-thinking-250715",
-        #doubao-seed-1-6-251015
-    )
-    parser.add_argument(
-        "--api_key",
-        type=str,
-        default=None,
-        help="Falls back to environment variable ARK_API_KEY when omitted.",
-    )
-    parser.add_argument(
-        "--base_url",
-        type=str,
-        default="https://ark.cn-beijing.volces.com/api/v3",
-    )
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data_format", choices=("auto", "hdf5", "lerobot", "lerobot_v3"), default="hdf5")
+    parser.add_argument("--root_dir", required=True)
+    parser.add_argument("--labels_root", help="External label root; mirrors <task>/<split>/auto_labels_v2.")
+    parser.add_argument("--output_dir", help="Legacy standalone-video output directory; use labels_root for LeRobot.")
+    parser.add_argument("--task_names", nargs="*", default=())
+    parser.add_argument("--split_names", nargs="*", default=())
+    parser.add_argument("--camera_key", help="Defaults to observation.images.cam_high for LeRobot, head_camera for standalone videos.")
+    parser.add_argument("--model_id", default="doubao-seed-1-6-thinking-250715")
+    parser.add_argument("--api_key", help="Defaults to the ARK_API_KEY environment variable.")
+    parser.add_argument("--base_url", default="https://ark.cn-beijing.volces.com/api/v3")
     parser.add_argument("--sample_fps", type=float, default=5.0)
     parser.add_argument("--max_frames", type=int, default=64)
     parser.add_argument("--videos_limit", type=int, default=-1)
     parser.add_argument("--max_new_tokens", type=int, default=2048)
-    parser.add_argument(
-        "--concurrency",
-        type=int,
-        default=5,
-        help="Number of videos to label in parallel.",
-    )
-    parser.add_argument(
-        "--max_attempts",
-        type=int,
-        default=3,
-        help="Maximum inference retries when validation fails.",
-    )
-    parser.add_argument(
-        "--no_resume",
-        dest="resume",
-        action="store_false",
-        help="Disable resume behaviour (process all videos regardless of existing outputs).",
-    )
+    parser.add_argument("--concurrency", type=int, default=5)
+    parser.add_argument("--max_attempts", type=int, default=3, help="Total API attempts per episode, including malformed responses.")
+    parser.add_argument("--no_resume", dest="resume", action="store_false")
     parser.set_defaults(resume=True)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.max_frames < 2 or args.sample_fps <= 0:
+        parser.error("max_frames must be at least 2 and sample_fps must be positive.")
+    if args.max_attempts < 1 or args.concurrency < 1:
+        parser.error("max_attempts and concurrency must be positive.")
+    if args.output_dir and args.labels_root:
+        parser.error("Use only one of output_dir and labels_root.")
+    if args.data_format == "auto":
+        args.data_format = "lerobot" if next(Path(args.root_dir).glob("**/meta/info.json"), None) else "hdf5"
+    if args.data_format == "lerobot_v3":
+        args.data_format = "lerobot"
+    if args.camera_key is None:
+        args.camera_key = "observation.images.cam_high" if args.data_format == "lerobot" else "head_camera"
+    if args.data_format == "lerobot" and args.output_dir:
+        parser.error("LeRobot uses labels_root, not output_dir.")
+    return args
 
 
 def discover_dataset_pairs(root_dir: str, output_dir: str) -> List[VideoSample]:
-    video_dir = os.path.join(root_dir, "video")
-    instruction_candidates = [
-        os.path.join(root_dir, "instructions"),
-        os.path.join(root_dir, "instruction"),
+    root = Path(root_dir)
+    instruction_dir = root / "instructions"
+    if not instruction_dir.is_dir():
+        instruction_dir = root / "instruction"
+    return [
+        VideoSample(str(video), str(instruction_dir / f"{video.stem}.json"),
+                    str(Path(output_dir) / f"{video.stem}_phases_labels_thinking.json"))
+        for video in sorted((root / "video").glob("*.mp4"))
     ]
-    instruction_dir = None
-    for cand in instruction_candidates:
-        if os.path.isdir(cand):
-            instruction_dir = cand
-            break
-    if not os.path.isdir(video_dir):
-        raise FileNotFoundError(f"Missing directory: {video_dir}")
-    if instruction_dir is None:
-        raise FileNotFoundError("Missing instruction directory.")
-    os.makedirs(output_dir, exist_ok=True)
-
-    samples: List[VideoSample] = []
-    for name in sorted(os.listdir(video_dir)):
-        if not name.lower().endswith(".mp4"):
-            continue
-        video_path = os.path.join(video_dir, name)
-        base = os.path.splitext(name)[0]
-        instruction_path = os.path.join(instruction_dir, base + ".json")
-        if not os.path.isfile(instruction_path):
-            raise FileNotFoundError(f"Missing instruction JSON: {instruction_path}")
-        output_path = os.path.join(output_dir, base + "_phases_labels_thinking.json")
-        samples.append(
-            VideoSample(
-                video_path=video_path,
-                instruction_path=instruction_path,
-                output_path=output_path,
-            )
-        )
-    if not samples:
-        raise FileNotFoundError("No .mp4 videos discovered.")
-    return samples
 
 
 def read_instruction_text(instruction_path: str) -> str:
-    with open(instruction_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    if isinstance(data, dict):
-        if "seen" in data and isinstance(data["seen"], list) and data["seen"]:
-            candidates = [
-                str(x).strip() for x in data["seen"] if isinstance(x, (str, int, float))
-            ]
-            if not candidates:
-                raise ValueError(f"No usable candidates in 'seen': {instruction_path}")
-            return random.choice(candidates)
-        if "instruction" in data:
-            return str(data["instruction"]).strip()
-    if isinstance(data, list) and data:
-        candidates = [str(x).strip() for x in data if isinstance(x, (str, int, float))]
-        if candidates:
-            return random.choice(candidates)
-    raise ValueError(f"No usable instruction text in {instruction_path}")
+    with open(instruction_path, encoding="utf-8") as stream:
+        data = json.load(stream)
+    candidates = data.get("seen", data.get("instruction", [])) if isinstance(data, dict) else data
+    if isinstance(candidates, str):
+        return candidates.strip()
+    # Stable annotation text makes the sidecar identity reproducible on resume.
+    return next(str(value).strip() for value in candidates if isinstance(value, (str, int, float)) and str(value).strip())
 
 
 def get_video_info(video_path: str) -> Tuple[float, int]:
@@ -148,8 +120,7 @@ def get_video_info(video_path: str) -> Tuple[float, int]:
 
 
 def frame_to_pil(frame) -> Image.Image:
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    return Image.fromarray(rgb)
+    return Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
 
 
 def read_frame_at(video_path: str, frame_idx: int) -> Tuple[int, Image.Image]:
@@ -164,43 +135,22 @@ def read_frame_at(video_path: str, frame_idx: int) -> Tuple[int, Image.Image]:
     return frame_idx, frame_to_pil(frame)
 
 
-def sample_video_frames(
-    video_path: str,
-    desired_sample_fps: float,
-    max_frames: int,
-) -> List[Tuple[int, Image.Image]]:
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise RuntimeError(f"Failed to open video: {video_path}")
-    video_fps = float(cap.get(cv2.CAP_PROP_FPS))
-    if video_fps <= 0.0:
-        cap.release()
-        raise ValueError(f"Invalid FPS ({video_fps}) for video: {video_path}")
-    stride = max(1, int(round(video_fps / max(0.1, desired_sample_fps))))
-    samples: List[Tuple[int, Image.Image]] = []
-    frame_idx = 0
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        if frame_idx % stride == 0:
-            samples.append((frame_idx, frame_to_pil(frame)))
-        frame_idx += 1
-    cap.release()
-    if not samples:
-        raise RuntimeError(f"No frames sampled from video: {video_path}")
-    if len(samples) > max_frames:
-        step = max(1, len(samples) // max_frames)
-        samples = samples[::step][:max_frames]
-    collected = {idx for idx, _ in samples}
-    if 0 not in collected:
-        samples.insert(0, read_frame_at(video_path, 0))
-    total_frames = int(frame_idx)
-    last_frame_idx = total_frames - 1
-    if last_frame_idx not in collected:
-        samples.append(read_frame_at(video_path, last_frame_idx))
-    samples.sort(key=lambda x: x[0])
-    return samples
+def sample_frame_indices(length: int, fps: float, sample_fps: float, max_frames: int) -> list[int]:
+    """Sample uniformly across the full episode, including both endpoints.
+
+    sample_fps controls the desired density before the frame budget is applied.
+    Long episodes retain full temporal coverage with a lower effective density.
+    """
+    if length == 1:
+        return [0]
+    desired_count = math.ceil((length - 1) * sample_fps / fps) + 1
+    count = min(length, max_frames, max(2, desired_count))
+    return [round(position * (length - 1) / (count - 1)) for position in range(count)]
+
+
+def sample_video_frames(video_path: str, desired_sample_fps: float, max_frames: int) -> List[Tuple[int, Image.Image]]:
+    fps, length = get_video_info(video_path)
+    return [read_frame_at(video_path, index) for index in sample_frame_indices(length, fps, desired_sample_fps, max_frames)]
 
 
 def to_data_url(image: Image.Image) -> str:
@@ -234,7 +184,7 @@ def build_messages(
         "   - Order phases according to actual motion. It's allowed that operate appears before move if that matches the video.\n"
         "3) Identify the primary_arm (left/right/both/unknown) and give a concise English subtask_description.\n"
         "4) Predict normalized coordinates (top-right origin (0,0), bottom-left (1,1)) for: target_object_axis, left_gripper_end_axis, right_gripper_end_axis. Use [-1,-1] if a gripper is absent.\n"
-        "5) Ensure the entire video contains AT LEAST ONE move phase among all subtasks.\n"
+        "5) Label only the motion actually present. An entire episode may contain only operate phases; never invent a move phase.\n"
         "6) Output STRICTLY a JSON array. No extra text, no markdown fences.\n"
         "Schema:\n"
         "[\n"
@@ -269,7 +219,9 @@ def build_messages(
         "- Frame indices are integers within [0, total_frames-1].\n"
         "- Phases are consecutive within a subtask: first phase starts at subtask start; last phase ends at subtask end.\n"
         "- Phase types limited to 'move'/'operate'. Within a subtask: one phase (move or operate) OR exactly two phases (one move and one operate). No duplicates; split into a new subtask when needed.\n"
-        "- The entire video must contain at least one move phase.\n"
+        "- Endpoints are INCLUSIVE episode-local state-frame indices. The next interval starts at the previous end + 1.\n"
+        "- Subtasks must start at 0 and finish at total_frames-1. Phases must fully cover their subtask without gaps or overlaps.\n"
+        "- Single-frame phases are valid. Pure-operate episodes are valid.\n"
         "- Output JSON array only (no commentary, no markdown).\n"
     )
 
@@ -317,7 +269,8 @@ def compose_messages_with_feedback(
             + issues
             + ". Fix by ensuring: 1) Do not duplicate a phase_type inside a subtask; instead start a new subtask for the extra action. "
               "2) Each subtask has 1 phase (move/operate) or exactly 2 (one move + one operate) in real temporal order. "
-              "3) The entire video contains at least one move phase. "
+              "3) Inclusive intervals cover the whole episode and each subtask exactly, with next start = previous end + 1. "
+              "4) Do not invent a move phase in a pure-operate episode. "
               "Return JSON array only."
         )
         messages[-1]["content"].append({"type": "text", "text": guidance})
@@ -325,7 +278,7 @@ def compose_messages_with_feedback(
 
 
 def create_client(api_key: str, base_url: str) -> OpenAI:
-    return OpenAI(api_key=api_key, base_url=base_url)
+    return OpenAI(api_key=api_key, base_url=base_url, max_retries=0)
 
 
 def run_inference(
@@ -368,175 +321,55 @@ def extract_json_array(text: str) -> List[Dict[str, object]]:
     return json.loads(snippet)
 
 
-def ensure_axis_pair(axis: List[float]) -> Tuple[List[float], str]:
-    if len(axis) != 2:
-        return [], f"Axis must have two elements: {axis}"
-    x = float(axis[0])
-    y = float(axis[1])
-    if x == -1.0 and y == -1.0:
+def ensure_axis_pair(axis: object) -> Tuple[List[float], str]:
+    if not isinstance(axis, list) or len(axis) != 2 or any(type(value) not in (int, float) for value in axis):
+        return [], f"Axis must contain two numbers: {axis}"
+    x, y = axis
+    if x == -1 and y == -1:
         return [-1.0, -1.0], ""
-    if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0):
+    if not (0 <= x <= 1 and 0 <= y <= 1):
         return [], f"Axis values must lie within [0,1] or be [-1,-1]: {axis}"
-    return [round(x, 4), round(y, 4)], ""
+    return [round(float(x), 4), round(float(y), 4)], ""
 
 
-def normalize_primary_arm(value: str) -> Tuple[str, str]:
-    lowered = value.strip().lower()
-    if lowered in {"left", "right", "both", "unknown"}:
-        return lowered, ""
-    return "", f"Unsupported primary_arm value: {value}"
-
-
-def validate_phases(
-    phases: List[Dict[str, object]],
-    subtask_start: int,
-    subtask_end: int,
-) -> Tuple[List[Dict[str, object]], str]:
-    return _validate_phases_internal(phases, subtask_start, subtask_end, relaxed=False)
-
-
-def validate_phases_relaxed(
-    phases: List[Dict[str, object]],
-    subtask_start: int,
-    subtask_end: int,
-) -> Tuple[List[Dict[str, object]], str]:
-    return _validate_phases_internal(phases, subtask_start, subtask_end, relaxed=True)
-
-
-def _validate_phases_internal(
-    phases: List[Dict[str, object]],
-    subtask_start: int,
-    subtask_end: int,
-    relaxed: bool,
-) -> Tuple[List[Dict[str, object]], str]:
-    if not phases:
-        return [], "Each subtask must contain at least one phase."
-    validated: List[Dict[str, object]] = []
-    seen_types: set[str] = set()
-    last_type: str | None = None
-    for phase in phases:
-        phase_type = str(phase["phase_type"]).strip().lower()
-        if phase_type not in {"move", "operate"}:
-            return [], f"Invalid phase_type: {phase_type}"
-        if not relaxed:
-            if phase_type in seen_types:
-                return [], "Duplicate phase types within a single subtask are not allowed."
-        else:
-            if last_type is not None and phase_type == last_type:
-                return [], "Consecutive duplicate phase types within a single subtask are not allowed."
-        start_idx = int(phase["start_frame_idx"])
-        end_idx = int(phase["end_frame_idx"])
-        if end_idx < start_idx:
-            return [], "Phase end must be >= start."
-        if end_idx > subtask_end:
-            return [], "Phase end exceeds subtask range."
-        if start_idx < subtask_start:
-            return [], f"Phase start {start_idx} is before subtask start {subtask_start}."
-        if start_idx > subtask_end:
-            return [], f"Phase start {start_idx} exceeds subtask end {subtask_end}."
-        desc = str(phase["phase_description"]).strip()
-        validated.append(
-            {
-                "phase_type": phase_type,
-                "phase_description": desc,
-                "start_frame_idx": start_idx,
-                "end_frame_idx": end_idx,
-            }
-        )
-        seen_types.add(phase_type)
-        last_type = phase_type
-    if not relaxed:
-        if len(validated) == 2:
-            phase_types = {validated[0]["phase_type"], validated[1]["phase_type"]}
-            if phase_types != {"move", "operate"}:
-                return [], "Two-phase subtasks must contain exactly one 'move' and one 'operate'."
-        if len(validated) > 2:
-            return [], "A subtask can contain at most two phases."
-    else:
-        if len(validated) > 5:
-            return [], "Relaxed validation allows at most five phases per subtask."
-        unique_types = {item["phase_type"] for item in validated}
-        if len(unique_types) < 2:
-            return [], "Relaxed validation still requires both move and operate when multiple phases are present."
-    return validated, ""
-
-
-def validate_subtasks(
-    subtasks: List[Dict[str, object]],
-    total_frames: int,
-) -> Tuple[List[Dict[str, object]], str]:
-    return _validate_subtasks_internal(subtasks, total_frames, relaxed=False)
-
-
-def validate_subtasks_relaxed(
-    subtasks: List[Dict[str, object]],
-    total_frames: int,
-) -> Tuple[List[Dict[str, object]], str]:
-    return _validate_subtasks_internal(subtasks, total_frames, relaxed=True)
-
-
-def _validate_subtasks_internal(
-    subtasks: List[Dict[str, object]],
-    total_frames: int,
-    relaxed: bool,
-) -> Tuple[List[Dict[str, object]], str]:
-    if not isinstance(subtasks, list):
-        return [], "Top-level JSON must be an array."
-    if not subtasks:
-        return [], "Model returned empty subtask list."
-    validated: List[Dict[str, object]] = []
-    has_move_phase = False
-    for idx, subtask in enumerate(subtasks, start=1):
-        subtask_id = int(subtask["subtask"])
-        if subtask_id != idx:
-            return [], "Subtask indices must be sequential starting at 1."
-        start_idx = int(subtask["start_frame_idx"])
-        end_idx = int(subtask["end_frame_idx"])
-        if end_idx < start_idx:
-            return [], f"Subtask {idx} end must be >= start."
-        if end_idx >= total_frames:
-            return [], f"Subtask {idx} end exceeds total frames."
-        desc = str(subtask["subtask_description"]).strip()
-        target_name = str(subtask["target_object_name"]).strip()
-        primary_arm, arm_err = normalize_primary_arm(str(subtask["primary_arm"]))
-        if arm_err:
-            return [], f"Subtask {idx}: {arm_err}"
-        axis_target, axis_err = ensure_axis_pair(list(subtask["target_object_axis"]))
-        if axis_err:
-            return [], f"Subtask {idx}: {axis_err}"
-        axis_left, axis_left_err = ensure_axis_pair(list(subtask["left_gripper_end_axis"]))
-        if axis_left_err:
-            return [], f"Subtask {idx}: {axis_left_err}"
-        axis_right, axis_right_err = ensure_axis_pair(list(subtask["right_gripper_end_axis"]))
-        if axis_right_err:
-            return [], f"Subtask {idx}: {axis_right_err}"
-        phase_entries = list(subtask.get("phases", []))
-        phase_validator = validate_phases_relaxed if relaxed else validate_phases
-        phases, phases_err = phase_validator(
-            phase_entries, start_idx, end_idx
-        )
-        if phases_err:
-            return [], f"Subtask {idx}: {phases_err}"
-        if any(phase["phase_type"] == "move" for phase in phases):
-            has_move_phase = True
-        validated.append(
-            {
-                "subtask": subtask_id,
-                "subtask_description": desc,
-                "primary_arm": primary_arm,
-                "start_frame_idx": start_idx,
-                "end_frame_idx": end_idx,
-                "target_object_name": target_name,
-                "target_object_axis": axis_target,
-                "left_gripper_end_axis": axis_left,
-                "right_gripper_end_axis": axis_right,
-                "phases": phases,
-            }
-        )
-    if validated[-1]["end_frame_idx"] != total_frames - 1:
-        return [], "Last subtask must end at total_frames - 1."
-    if not has_move_phase:
-        return [], "At least one phase across the video must be of type 'move'."
+def validate_subtasks(subtasks: object, total_frames: int) -> Tuple[List[Dict[str, object]], str]:
+    """Validate the complete annotation schema and exact temporal coverage."""
+    temporal_error = validate_phase_labels(subtasks, total_frames)
+    if temporal_error:
+        return [], temporal_error
+    validated = []
+    for index, subtask in enumerate(subtasks, start=1):
+        if type(subtask.get("subtask")) is not int or subtask["subtask"] != index:
+            return [], "Subtask indices must be integers sequentially starting at 1."
+        for field in ("subtask_description", "target_object_name", "primary_arm"):
+            if not isinstance(subtask.get(field), str) or not subtask[field].strip():
+                return [], f"Subtask {index}: {field} must be a nonempty string."
+        arm = subtask["primary_arm"].strip().lower()
+        if arm not in ("left", "right", "both", "unknown"):
+            return [], f"Subtask {index}: unsupported primary_arm {arm}."
+        item = {key: subtask[key] for key in ("subtask", "start_frame_idx", "end_frame_idx")}
+        item.update(primary_arm=arm, subtask_description=subtask["subtask_description"].strip(),
+                    target_object_name=subtask["target_object_name"].strip())
+        for field in ("target_object_axis", "left_gripper_end_axis", "right_gripper_end_axis"):
+            axis, error = ensure_axis_pair(subtask.get(field))
+            if error:
+                return [], f"Subtask {index}: {field}: {error}"
+            item[field] = axis
+        phases = subtask["phases"]
+        types = [phase["phase_type"] for phase in phases]
+        if len(types) > 2 or len(set(types)) != len(types):
+            return [], f"Subtask {index}: use at most one move and one operate phase; split repeated phases into another subtask."
+        item["phases"] = []
+        for phase in phases:
+            if not isinstance(phase.get("phase_description"), str) or not phase["phase_description"].strip():
+                return [], f"Subtask {index}: phase_description must be a nonempty string."
+            item["phases"].append({
+                "phase_type": phase["phase_type"],
+                "phase_description": phase["phase_description"].strip(),
+                "start_frame_idx": phase["start_frame_idx"],
+                "end_frame_idx": phase["end_frame_idx"],
+            })
+        validated.append(item)
     return validated, ""
 
 
@@ -549,115 +382,194 @@ def resolve_api_key(explicit: str | None) -> str:
     raise ValueError("API key required. Use --api_key or set ARK_API_KEY.")
 
 
-def process_video(
-    client: OpenAI,
-    model_id: str,
-    sample: VideoSample,
-    sample_fps: float,
-    max_frames: int,
-    max_new_tokens: int,
-    max_attempts: int,
-) -> None:
-    instruction = read_instruction_text(sample.instruction_path)
-    fps, total_frames = get_video_info(sample.video_path)
-    samples = sample_video_frames(
-        sample.video_path, desired_sample_fps=sample_fps, max_frames=max_frames
+def build_metadata(args: argparse.Namespace, relative_id: str, episode_index: int | str,
+                   length: int, fps: float, instruction: str, source: dict) -> dict:
+    indices = sample_frame_indices(length, fps, args.sample_fps, args.max_frames)
+    return {
+        "relative_id": relative_id,
+        "episode_index": episode_index,
+        "length": length,
+        "fps": fps,
+        "camera": args.camera_key,
+        "instruction": instruction,
+        "frame_space": "episode_local",
+        "end_convention": "inclusive",
+        "model": {"id": args.model_id, "base_url": args.base_url, "max_new_tokens": args.max_new_tokens},
+        "sampling": {"method": "uniform_full_episode", "sample_fps": args.sample_fps,
+                     "max_frames": args.max_frames, "frame_indices": indices},
+        "source": source,
+    }
+
+
+def existing_label_error(job: AnnotationJob) -> str | None:
+    labels, error = load_phase_labels(job.output_path, job.metadata["length"])
+    if error:
+        return error
+    _, error = validate_subtasks(labels, job.metadata["length"])
+    if error:
+        return error
+    metadata_path = label_metadata_path(job.output_path)
+    try:
+        with metadata_path.open(encoding="utf-8") as stream:
+            metadata = json.load(stream)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        return f"Cannot read metadata {metadata_path}: {error}"
+    if not isinstance(metadata, dict):
+        return "Label metadata must be an object."
+    for key, expected in job.metadata.items():
+        if metadata.get(key) != expected:
+            return f"Label metadata mismatch for {key}."
+    return None
+
+
+def archive_invalid_labels(path: Path) -> list[str]:
+    """Retain rejected annotations outside the filenames consumed by training."""
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    archived_label = path.with_name(f"{path.stem}.invalid.{timestamp}.json")
+    path.rename(archived_label)
+    archived = [str(archived_label)]
+    metadata_path = label_metadata_path(path)
+    if metadata_path.exists():
+        archived_metadata = label_metadata_path(archived_label)
+        metadata_path.rename(archived_metadata)
+        archived.append(str(archived_metadata))
+    return archived
+
+
+def make_jobs(args: argparse.Namespace) -> tuple[list[AnnotationJob], LeRobotReader | None, list[dict]]:
+    root = Path(args.root_dir).expanduser().resolve()
+    labels_root = Path(args.labels_root).expanduser().resolve() if args.labels_root else None
+    jobs, failures = [], []
+    if args.data_format == "lerobot":
+        from mto.lerobot_reader import LeRobotReader
+
+        reader = LeRobotReader(root, task_names=args.task_names, split_names=args.split_names)
+        episodes = reader.episodes[:args.videos_limit] if args.videos_limit > 0 else reader.episodes
+        for episode in episodes:
+            output = label_path(episode.dataset_root, episode.relative_id, episode.episode_index, labels_root)
+            instruction = reader.get_instruction(episode)
+            source = {
+                "data_format": "lerobot_v3", "dataset_root": str(episode.dataset_root),
+                "codebase_version": episode.info["codebase_version"],
+                "data_path": episode.info["data_path"], "video_path": episode.info["video_path"],
+                "episode_metadata": {
+                    key: value for key, value in episode.metadata.items()
+                    if key in ("dataset_from_index", "dataset_to_index", "data/chunk_index", "data/file_index")
+                    or key.startswith(f"videos/{args.camera_key}/")
+                },
+            }
+            metadata = build_metadata(args, episode.relative_id, episode.episode_index,
+                                      episode.length, episode.fps, instruction, source)
+            jobs.append(AnnotationJob(output, metadata, metadata["sampling"]["frame_indices"], episode=episode))
+        return jobs, reader, failures
+
+    relative_id = f"{root.parent.name}/{root.name}"
+    output_dir = Path(args.output_dir) if args.output_dir else (
+        (labels_root / relative_id if labels_root else root) / "auto_labels_v2"
     )
-    base_messages = build_messages(instruction, total_frames, samples, fps)
-    feedbacks: List[str] = []
-    final_validated: List[Dict[str, object]] = []
-    final_raw = ""
-    attempts = max(1, max_attempts)
-    for attempt in range(attempts):
+    samples = discover_dataset_pairs(str(root), str(output_dir))
+    if args.videos_limit > 0:
+        samples = samples[:args.videos_limit]
+    for sample in samples:
+        try:
+            instruction = read_instruction_text(sample.instruction_path)
+            fps, length = get_video_info(sample.video_path)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError, StopIteration, RuntimeError) as error:
+            failures.append({"source": sample.video_path, "error": str(error)})
+            continue
+        video = Path(sample.video_path)
+        episode_id = video.stem.removeprefix("episode")
+        episode_index = int(episode_id) if episode_id.isdecimal() else video.stem
+        stat = video.stat()
+        source = {"data_format": "hdf5_video", "dataset_root": str(root), "video_path": str(video),
+                  "instruction_path": sample.instruction_path, "video_size": stat.st_size,
+                  "video_mtime_ns": stat.st_mtime_ns}
+        metadata = build_metadata(args, relative_id, episode_index, length, fps, instruction, source)
+        jobs.append(AnnotationJob(Path(sample.output_path), metadata, metadata["sampling"]["frame_indices"],
+                                  video_path=sample.video_path))
+    return jobs, None, failures
+
+
+def process_job(client: OpenAI, args: argparse.Namespace, job: AnnotationJob,
+                reader: LeRobotReader | None) -> dict:
+    if job.episode is not None:
+        images = reader.read_rgb(job.episode, args.camera_key, job.frame_indices)
+        samples = list(zip(job.frame_indices, images, strict=True))
+    else:
+        samples = [read_frame_at(job.video_path, index) for index in job.frame_indices]
+    base_messages = build_messages(job.metadata["instruction"], job.metadata["length"], samples, job.metadata["fps"])
+    feedbacks, final_raw, validated = [], "", []
+    for attempt in range(1, args.max_attempts + 1):
         messages = compose_messages_with_feedback(base_messages, feedbacks)
-        raw_text = run_inference(
-            client=client,
-            model_id=model_id,
-            messages=messages,
-            max_new_tokens=max_new_tokens,
-        )
-        final_raw = raw_text
-        parsed = extract_json_array(raw_text)
-        validated, validation_error = validate_subtasks(parsed, total_frames)
-        if not validation_error:
-            final_validated = validated
+        try:
+            final_raw = run_inference(client, args.model_id, messages, args.max_new_tokens)
+            parsed = extract_json_array(final_raw)
+            validated, error = validate_subtasks(parsed, job.metadata["length"])
+        except (APIConnectionError, APIStatusError, json.JSONDecodeError, ValueError, KeyError, TypeError, IndexError) as exception:
+            error = f"{type(exception).__name__}: {exception}"
+        if not error:
             break
-        feedbacks.append(validation_error)
-        print(f"[retry] {os.path.basename(sample.video_path)} attempt {attempt + 1}: {validation_error}")
-    os.makedirs(os.path.dirname(sample.output_path), exist_ok=True)
-    # Always save the last raw response for debugging, even if validation failed
-    raw_path = sidecar_path(sample.output_path, "_phases_raw.txt")
-    with open(raw_path, "w", encoding="utf-8") as f:
-        f.write(final_raw)
-    if not final_validated:
-        relaxed_validated, relaxed_error = validate_subtasks_relaxed(parsed, total_frames)
-        if not relaxed_error:
-            final_validated = relaxed_validated
-            print(f"[warn] {os.path.basename(sample.video_path)} accepted via relaxed validation fallback.")
-        else:
-            err_path = sidecar_path(sample.output_path, "_phases_error.txt")
-            last_error = relaxed_error or (feedbacks[-1] if feedbacks else "unknown validation failure")
-            with open(err_path, "w", encoding="utf-8") as f:
-                f.write(last_error)
-            raise RuntimeError(f"Failed to obtain valid labels after {attempts} attempts: {last_error}")
-    with open(sample.output_path, "w", encoding="utf-8") as f:
-        json.dump(final_validated, f, ensure_ascii=False, indent=2)
-    print(f"Saved labels: {sample.output_path}")
+        feedbacks.append(error)
+        print(f"[retry] {job.identity} attempt {attempt}/{args.max_attempts}: {error}")
+    job.output_path.parent.mkdir(parents=True, exist_ok=True)
+    Path(sidecar_path(str(job.output_path), "_phases_raw.txt")).write_text(final_raw, encoding="utf-8")
+    error_path = Path(sidecar_path(str(job.output_path), "_phases_error.txt"))
+    if not validated:
+        error_path.write_text("\n".join(feedbacks), encoding="utf-8")
+        return {"identity": job.identity, "path": str(job.output_path), "status": "failed", "errors": feedbacks}
+    job.output_path.write_text(json.dumps(validated, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    metadata = {**job.metadata, "created_at": datetime.now(timezone.utc).isoformat(), "attempts": attempt}
+    label_metadata_path(job.output_path).write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    if error_path.exists():
+        error_path.unlink()
+    print(f"Saved labels: {job.output_path}")
+    return {"identity": job.identity, "path": str(job.output_path), "status": "annotated"}
 
 
 def main() -> None:
     args = parse_args()
-    output_dir = args.output_dir or os.path.join(args.root_dir, "auto_labels_v2")
-    samples = discover_dataset_pairs(args.root_dir, output_dir)
-    if args.videos_limit > 0:
-        samples = samples[: args.videos_limit]
-    if args.resume:
-        remaining: List[VideoSample] = []
-        for sample in samples:
-            if os.path.isfile(sample.output_path) and os.path.getsize(sample.output_path) > 0:
-                print(f"[resume] Skipping existing: {os.path.basename(sample.output_path)}")
-                continue
-            remaining.append(sample)
-        samples = remaining
-    if not samples:
-        raise RuntimeError("No videos to process after resume filtering.")
-    api_key = resolve_api_key(args.api_key)
+    jobs, reader, source_errors = make_jobs(args)
+    summary = {"selected": len(jobs) + len(source_errors), "valid_existing": 0,
+               "missing_labels_before": 0, "invalid_labels_before": 0, "annotated": 0,
+               "failed": len(source_errors), "source_errors": source_errors, "invalid_existing": [], "failures": []}
+    pending = []
+    for job in jobs:
+        if not job.output_path.is_file():
+            summary["missing_labels_before"] += 1
+        else:
+            error = existing_label_error(job)
+            if error:
+                summary["invalid_labels_before"] += 1
+                archived = archive_invalid_labels(job.output_path)
+                summary["invalid_existing"].append({"identity": job.identity, "path": str(job.output_path),
+                                                    "error": error, "archived": archived})
+            else:
+                summary["valid_existing"] += 1
+                if args.resume:
+                    print(f"[resume] Valid labels and metadata: {job.identity}")
+                    continue
+        pending.append(job)
+    if pending:
+        api_key = resolve_api_key(args.api_key)
 
-    def run_single(sample: VideoSample, position: int, total: int) -> None:
-        print(f"[{position}/{total}] Processing {os.path.basename(sample.video_path)}")
-        client_local = create_client(api_key=api_key, base_url=args.base_url)
-        process_video(
-            client=client_local,
-            model_id=args.model_id,
-            sample=sample,
-            sample_fps=args.sample_fps,
-            max_frames=args.max_frames,
-            max_new_tokens=args.max_new_tokens,
-            max_attempts=args.max_attempts,
-        )
+        def run_single(job: AnnotationJob) -> dict:
+            local_reader = copy(reader) if reader is not None else None
+            if local_reader is not None:
+                local_reader._row_cache = OrderedDict()
+            with create_client(api_key, args.base_url) as client:
+                return process_job(client, args, job, local_reader)
 
-    total = len(samples)
-    concurrency = max(1, int(args.concurrency))
-    if concurrency == 1 or total == 1:
-        for idx, sample in enumerate(samples, start=1):
-            run_single(sample, idx, total)
-    else:
-        with ThreadPoolExecutor(max_workers=concurrency) as executor:
-            futures = {
-                executor.submit(run_single, sample, idx, total): sample
-                for idx, sample in enumerate(samples, start=1)
-            }
-            first_error: Exception | None = None
+        with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
+            futures = [executor.submit(run_single, job) for job in pending]
             for future in as_completed(futures):
-                try:
-                    future.result()
-                except Exception as exc:
-                    sample = futures[future]
-                    print(f"[error] {os.path.basename(sample.video_path)} failed: {exc}")
-                    if first_error is None:
-                        first_error = exc
-            if first_error is not None:
-                raise first_error
+                result = future.result()
+                if result["status"] == "annotated":
+                    summary["annotated"] += 1
+                else:
+                    summary["failed"] += 1
+                    summary["failures"].append(result)
+    summary["complete"] = summary["selected"] > 0 and summary["failed"] == 0
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

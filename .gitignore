@@ -22,3 +22,6 @@ logs/
 *.npz
 *.log
 qpos*_normalization_stats*.json
+
+eval_results/
+mto_traces/

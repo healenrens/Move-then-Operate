@@ -12,8 +12,6 @@ contract, with twelve joint deltas relative to the chunk's initial state and
 two absolute gripper values. It does not use the Aloha coordinate conversion.
 """
 
-import json
-import pathlib
 from typing import Literal
 
 import flax.nnx as nnx
@@ -28,6 +26,7 @@ from openpi.models import mto_config
 from openpi.models import pi0_moe
 from openpi.models.tokenizer import PaligemmaTokenizer
 from openpi.shared import nnx_utils
+from mto.normalization import ACTION_REPRESENTATION, QposNormalizer
 
 
 _CAMERAS = {
@@ -36,44 +35,6 @@ _CAMERAS = {
     "right_camera": "right_wrist_0_rgb",
 }
 _JOINT_INDICES = np.array([0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12])
-_NORMALIZATION_EPS = 1e-6
-
-
-class QposNormalizer:
-    """Read the standalone action/proprio statistics used by the phase dataset."""
-
-    def __init__(self, path: str | pathlib.Path, method: Literal["zscore", "min_max"] = "zscore"):
-        with pathlib.Path(path).open(encoding="utf-8") as stream:
-            payload = json.load(stream)
-        statistics = payload.get("statistics", payload)
-        self.method = method
-        self.offset = {}
-        self.scale = {}
-        for key in ("action", "proprio"):
-            dims = [statistics[key][f"dim_{i}"] for i in _JOINT_INDICES]
-            if method == "zscore":
-                self.offset[key] = np.array([dim["mean"] for dim in dims], dtype=np.float32)
-                self.scale[key] = np.array([dim["std"] for dim in dims], dtype=np.float32) + _NORMALIZATION_EPS
-            else:
-                low = np.array([dim["percentile_1"] for dim in dims], dtype=np.float32)
-                high = np.array([dim["percentile_99"] for dim in dims], dtype=np.float32)
-                self.offset[key] = low
-                self.scale[key] = np.maximum(high - low, _NORMALIZATION_EPS)
-
-    def normalize_state(self, state: np.ndarray) -> np.ndarray:
-        output = np.array(state, dtype=np.float32, copy=True)
-        joints = (output[..., _JOINT_INDICES] - self.offset["proprio"]) / self.scale["proprio"]
-        if self.method == "min_max":
-            joints = np.clip(joints, 0.0, 1.0)
-        output[..., _JOINT_INDICES] = joints
-        return output
-
-    def unnormalize_actions(self, actions: np.ndarray) -> np.ndarray:
-        output = np.array(actions, dtype=np.float32, copy=True)
-        output[..., _JOINT_INDICES] = (
-            output[..., _JOINT_INDICES] * self.scale["action"] + self.offset["action"]
-        )
-        return output
 
 
 class _CachedExpertDecoder(nnx.Module):
@@ -153,7 +114,7 @@ class MtoPolicy(base_policy.BasePolicy):
 
     ``params_path`` points directly to an OpenPI ``params`` directory. The
     config must describe the saved model, including LoRA variants and horizon.
-    To use shared normalization, pass the same JSON for both phase paths.
+    Move and operate each load their own independently computed statistics.
     """
 
     def __init__(
@@ -184,6 +145,7 @@ class MtoPolicy(base_policy.BasePolicy):
         self._action_dim = config.action_dim
         self._action_horizon = config.action_horizon
         self._num_steps = num_steps
+        self._seed = seed
         self._rng = jax.random.key(seed)
 
     @property
@@ -194,9 +156,16 @@ class MtoPolicy(base_policy.BasePolicy):
             "action_horizon": self._action_horizon,
             "action_dim": 14,
             "action_type": "absolute_qpos",
+            "normalization_mode": "per-expert",
+            "normalization_phases": [n.metadata.get("phase") for n in self._normalizers],
+            "action_representation": ACTION_REPRESENTATION,
+            "state_layout": "left_arm6,left_gripper,right_arm6,right_gripper",
         }
 
-    def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:
+    def reset(self, seed: int | None = None) -> None:
+        self._rng = jax.random.key(self._seed if seed is None else seed)
+
+    def _observation(self, obs: dict):
         base_state = np.asarray(obs["state"], dtype=np.float32)
         images = {}
         for source, destination in _CAMERAS.items():
@@ -213,6 +182,24 @@ class MtoPolicy(base_policy.BasePolicy):
             tokenized_prompt=jnp.asarray(tokens[None, ...], dtype=jnp.int32),
             tokenized_prompt_mask=jnp.asarray(prompt_mask[None, ...]),
         )
+        return base_state, observation
+
+    def warmup(self) -> None:
+        """Compile both static decoders before the service becomes ready."""
+        base, observation = self._observation({
+            "state": np.zeros(14, np.float32), "prompt": "warmup",
+            "images": {name: np.zeros((224, 224, 3), np.uint8) for name in _CAMERAS},
+        })
+        prefix_mask, cache, _ = self._encode_context(observation)
+        noise = jnp.zeros((1, self._action_horizon, self._action_dim), jnp.float32)
+        for expert_index, normalizer in enumerate(self._normalizers):
+            state = np.pad(normalizer.normalize_state(base), (0, self._action_dim - 14))[None]
+            sampled = self._decode_expert(prefix_mask, cache, jnp.asarray(state), noise,
+                                          expert_index=expert_index, num_steps=self._num_steps)
+            jax.block_until_ready(sampled)
+
+    def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:
+        base_state, observation = self._observation(obs)
         prefix_mask, kv_cache, probabilities = self._encode_context(observation)
         probabilities = np.asarray(probabilities[0])
         expert_index = int(np.argmax(probabilities))

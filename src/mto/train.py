@@ -3,6 +3,12 @@ from __future__ import annotations
 import dataclasses
 import functools
 import logging
+import json
+from pathlib import Path
+import random
+import shutil
+import subprocess
+from datetime import datetime, timezone
 from typing import Iterator, Literal
 
 import flax.nnx as nnx
@@ -10,7 +16,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import torch
-from torchvision import transforms
 import tyro
 
 from flax.training import common_utils
@@ -26,7 +31,7 @@ import openpi.training.sharding as sharding
 import openpi.training.weight_loaders as _weight_loaders
 import openpi.training.utils as training_utils
 
-from mto.dataset import WideCameraDataset, wide_camera_collate_fn
+from mto.dataset import PhaseDataset, wide_camera_collate_fn
 
 
 @dataclasses.dataclass
@@ -68,25 +73,23 @@ class WideCameraTrainConfig:
     tokenizer_path: str | None = None
 
     data_type: Literal["qpos"] = "qpos"
-    task_name: str = ""
-    enable_soft_route_labels: bool = False
+    data_format: Literal["auto", "hdf5", "lerobot_v3", "lerobot"] = "lerobot_v3"
+    labels_root: str | None = None
+    task_names: tuple[str, ...] = ()
+    split_names: tuple[str, ...] = ()
+    drop_small_action_deltas: bool = False
+    min_action_magnitude: float = 1e-5
     normalize_method: Literal["zscore", "min_max"] = "zscore"
     long_phase_ratio: float = 0.5
 
     log_gradient_diagnostics: bool = False
-    image_size: tuple[int, int] = (224, 224)
     freeze_paligemma: bool = False
-    use_shared_action_norm_stats: bool = True
     move_norm_stats_path: str | None = None
     operate_norm_stats_path: str | None = None
-    shared_norm_stats_path: str | None = None
 
 
 def _create_train_config(cfg: WideCameraTrainConfig) -> _config.TrainConfig:
-    if cfg.batch_size % jax.process_count() != 0:
-        raise ValueError(
-            f"Batch size {cfg.batch_size} must be divisible by the number of processes {jax.process_count()}."
-        )
+    assert cfg.batch_size % jax.device_count() == 0, "Global batch size must divide across devices"
 
     if cfg.init_params is not None:
         weight_loader: _weight_loaders.WeightLoader = _weight_loaders.MtoWeightLoader(cfg.init_params, cfg.init_source)
@@ -253,35 +256,31 @@ def _shard_actions(actions: np.ndarray, sharding: jax.sharding.NamedSharding) ->
     return jax.make_array_from_process_local_data(sharding, actions)
 
 
+def create_dataset(cfg: WideCameraTrainConfig) -> PhaseDataset:
+    return PhaseDataset(
+        data_dir=cfg.data_root, data_format=cfg.data_format, labels_root=cfg.labels_root,
+        task_names=cfg.task_names, split_names=cfg.split_names, action_steps=cfg.action_horizon,
+        normalize_method=cfg.normalize_method, long_phase_ratio=cfg.long_phase_ratio,
+        drop_small_action_deltas=cfg.drop_small_action_deltas, min_action_magnitude=cfg.min_action_magnitude,
+        move_norm_stats_path=cfg.move_norm_stats_path, operate_norm_stats_path=cfg.operate_norm_stats_path,
+    )
+
+
+def seed_worker(worker_id):
+    seed = torch.initial_seed() % (2**32)
+    np.random.seed(seed)
+    random.seed(seed)
+
+
 def create_data_iterator(
     cfg: WideCameraTrainConfig,
     tokenizer: PaligemmaTokenizer,
     sharding: jax.sharding.NamedSharding,
+    dataset: PhaseDataset | None = None,
 ) -> Iterator[tuple[_model.Observation, jax.Array]]:
-    image_transform = transforms.Compose(
-        [
-            transforms.Resize(cfg.image_size, interpolation=transforms.InterpolationMode.BICUBIC),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
-        ]
-    )
-
-    dataset = WideCameraDataset(
-        data_dir=cfg.data_root,
-        action_steps=cfg.action_horizon,
-        image_transform=image_transform,
-        normalize_actions=True,
-        data_type=cfg.data_type,
-        task_name=[cfg.task_name] if cfg.task_name else [],
-        enable_soft_route_labels=cfg.enable_soft_route_labels,
-        normalize_method=cfg.normalize_method,
-        long_phase_ratio=cfg.long_phase_ratio,
-        use_shared_action_norm_stats=cfg.use_shared_action_norm_stats,
-        move_norm_stats_path=cfg.move_norm_stats_path,
-        operate_norm_stats_path=cfg.operate_norm_stats_path,
-        shared_norm_stats_path=cfg.shared_norm_stats_path,
-    )
-
+    if dataset is None:
+        dataset = create_dataset(cfg)
+    generator = torch.Generator().manual_seed(cfg.seed + jax.process_index())
     local_batch_size = cfg.batch_size // jax.process_count()
     loader = torch.utils.data.DataLoader(
         dataset,
@@ -289,9 +288,12 @@ def create_data_iterator(
         # Samples choose a phase independently of the index. Keep full batches
         # available even when a small dataset has fewer phases than the batch.
         sampler=torch.utils.data.RandomSampler(
-            dataset, replacement=True, num_samples=max(len(dataset), local_batch_size)
+            dataset, replacement=True, num_samples=max(len(dataset), local_batch_size), generator=generator
         ),
         num_workers=cfg.num_workers,
+        worker_init_fn=seed_worker,
+        generator=generator,
+        multiprocessing_context="spawn" if cfg.num_workers else None,
         pin_memory=True,
         persistent_workers=cfg.num_workers > 0,
         collate_fn=wide_camera_collate_fn,
@@ -311,10 +313,64 @@ def create_data_iterator(
             yield sharded_obs, sharded_actions
 
 
+def record_run(cfg, train_config, dataset, *, resuming):
+    root = train_config.checkpoint_dir
+    payload = dataclasses.asdict(cfg)
+    payload["normalization_mode"] = "per-expert"
+    payload.update(raw_action_dim=14, gripper_indices=[6, 13],
+                   action_representation="joint14_delta_joint_absolute_gripper",
+                   phase_end_convention="inclusive_state_frame", sampling_clock="raw_episode_frames")
+    payload["model"] = dataclasses.asdict(train_config.model)
+    revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parents[2],
+                              capture_output=True, text=True, check=False)
+    payload["source_commit"] = revision.stdout.strip() or None
+    payload["created_at"] = datetime.now(timezone.utc).isoformat()
+    payload["resume_restores"] = "model, optimizer, EMA, step; RNG and data iterator restart from configured seed"
+    name = "resume_config.json" if resuming else "resolved_config.json"
+    (root / name).write_text(json.dumps(payload, indent=2, default=str) + "\n")
+    manifest_name = "resume_data_manifest.json" if resuming else "data_manifest.json"
+    (root / manifest_name).write_text(json.dumps(dataset.manifest, indent=2) + "\n")
+
+
+def archive_normalization(cfg, root, *, resuming):
+    assets = root / "assets"
+    assets.mkdir(parents=True, exist_ok=True)
+    for phase in ("move", "operate"):
+        target = assets / f"{phase}.json"
+        if not resuming:
+            source = Path(getattr(cfg, f"{phase}_norm_stats_path")).resolve()
+            if source != target.resolve():
+                shutil.copyfile(source, target)
+        setattr(cfg, f"{phase}_norm_stats_path", str(target.resolve()))
+
+
+def resolve_resume_config(cfg: WideCameraTrainConfig) -> WideCameraTrainConfig:
+    path = Path(cfg.checkpoint_base_dir) / "wide_camera_dual_expert" / cfg.exp_name / "resolved_config.json"
+    if not cfg.resume or cfg.overwrite or not path.exists():
+        return cfg
+    saved = json.loads(path.read_text())
+    # A continuation keeps the original model/data/normalization/optimizer
+    # contract. Operational settings and the total training budget may change.
+    operational = {"exp_name", "checkpoint_base_dir", "num_steps", "num_workers", "log_interval",
+                   "save_interval", "keep_period", "resume", "overwrite", "wandb_enabled", "fsdp_devices"}
+    updates = {field.name: saved[field.name] for field in dataclasses.fields(cfg)
+               if field.name not in operational}
+    updates["task_names"] = tuple(updates["task_names"])
+    updates["split_names"] = tuple(updates["split_names"])
+    changed = [key for key, value in updates.items() if getattr(cfg, key) != value]
+    if changed:
+        print(f"Resuming with saved settings for: {', '.join(changed)}. Source: {path}")
+    return dataclasses.replace(cfg, **updates)
+
+
 def main(cfg: WideCameraTrainConfig) -> None:
+    cfg = resolve_resume_config(cfg)
     train_config = _create_train_config(cfg)
 
     init_logging()
+    random.seed(cfg.seed + jax.process_index())
+    np.random.seed(cfg.seed + jax.process_index())
+    torch.manual_seed(cfg.seed + jax.process_index())
     rng = jax.random.key(train_config.seed)
     train_rng, init_rng = jax.random.split(rng)
 
@@ -330,8 +386,12 @@ def main(cfg: WideCameraTrainConfig) -> None:
     )
     init_wandb(train_config, resuming=resuming, enabled=train_config.wandb_enabled)
 
+    archive_normalization(cfg, train_config.checkpoint_dir, resuming=resuming)
+    dataset = create_dataset(cfg)
+    record_run(cfg, train_config, dataset, resuming=resuming)
+
     tokenizer = PaligemmaTokenizer(max_len=train_config.model.max_token_len, model_path=cfg.tokenizer_path)
-    data_iterator = create_data_iterator(cfg, tokenizer, data_sharding)
+    data_iterator = create_data_iterator(cfg, tokenizer, data_sharding, dataset)
     batch = next(data_iterator)
     logging.info("Initialized data iterator:\n%s", training_utils.array_tree_to_info(batch))
 

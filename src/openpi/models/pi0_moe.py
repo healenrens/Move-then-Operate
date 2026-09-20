@@ -418,7 +418,9 @@ class Pi0(_model.BaseModel):
         masked_sum = jnp.sum(sq_flow * combined_mask, axis=-1)
         # The trainer averages this [B, H] array. Scale its contributions so that
         # the resulting scalar is averaged over valid action elements only.
-        loss_scale = masked_sum.size / jnp.sum(combined_mask)
+        # An explicitly filtered all-stationary batch has no flow targets;
+        # it contributes zero flow loss while retaining router supervision.
+        loss_scale = masked_sum.size / jnp.maximum(jnp.sum(combined_mask), 1.0)
         flow_mse = masked_sum * loss_scale
 
         expert_sq = jnp.square(expert_outputs - u_t[..., None])

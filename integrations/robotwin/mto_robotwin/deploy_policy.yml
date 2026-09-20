@@ -1,0 +1,7 @@
+# Consumed by integrations and tools using get_model/eval/reset_model.
+# MTO's own current-RoboTwin evaluator is python -m mto.eval_robotwin.
+policy_name: mto_robotwin
+server_host: 127.0.0.1
+server_port: 9700
+exec_steps: 30
+trace_dir: mto_traces
