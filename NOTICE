@@ -1,0 +1,10 @@
+Move-then-Operate
+
+This distribution includes modified code from OpenPI:
+https://github.com/Physical-Intelligence/openpi
+
+OpenPI is made available by Physical Intelligence under the Apache License,
+Version 2.0. Original notices in the retained source files are preserved.
+
+The MTO modifications include phase-supervised dual experts, hard-switch
+inference, phase annotation, and joint-position data processing.

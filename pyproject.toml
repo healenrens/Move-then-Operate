@@ -1,0 +1,62 @@
+[project]
+name = "move-then-operate"
+version = "0.1.0"
+description = "JAX hard-switch dual-expert vision-language-action policy"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+license = { file = "LICENSE" }
+dependencies = [
+    "augmax==0.4.1",
+    "beartype==0.19.0",
+    "einops==0.8.1",
+    "etils[epath]==1.12.2",
+    "flax==0.10.2",
+    "fsspec[gcs]==2025.3.0",
+    "filelock>=3.16.1,<4",
+    "h5py==3.13.0",
+    "jax==0.5.3",
+    "jaxtyping==0.2.36",
+    "ml-dtypes==0.4.1",
+    "msgpack>=1.0.5,<2",
+    "numpy==1.26.4",
+    "openai>=1.65,<2",
+    "opencv-python-headless==4.11.0.86",
+    "optax==0.2.4",
+    "orbax-checkpoint==0.11.13",
+    "pillow>=11,<12",
+    "sentencepiece==0.2.0",
+    "tensorstore==0.1.74",
+    "torch==2.7.1",
+    "torchvision==0.22.1",
+    "tqdm-loggable>=0.2,<1",
+    "typing-extensions>=4.12.2,<5",
+    "tyro==0.9.22",
+    "wandb==0.19.11",
+    "websockets==15.0.1",
+]
+
+[project.optional-dependencies]
+cuda12 = ["jax[cuda12]==0.5.3; sys_platform == 'linux' and platform_machine == 'x86_64'"]
+
+[project.urls]
+Repository = "https://github.com/healenrens/Move-then-Operate"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mto", "src/openpi", "src/openpi_client"]
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+torchvision = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
