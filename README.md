@@ -182,9 +182,11 @@ git ls-files -z > /tmp/mto-publication-files
 "$MTO_PY" scripts/check_release.py --root "$MTO_DIR" --file-list /tmp/mto-publication-files
 ```
 ## Citation
+```
 @article{xu2026move,
   title={Move-Then-Operate: Behavioral Phasing for Human-Like Robotic Manipulation},
   author={Xu, Haoming and Lei, Lei and Gu, Jie and Tang, Chu and Chen, Jingmin and Wang, Ruiqi},
   journal={arXiv preprint arXiv:2604.23620},
   year={2026}
 }
+```
