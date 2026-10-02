@@ -181,5 +181,10 @@ JAX_PLATFORMS=cpu "$MTO_PY" -m unittest discover -s tests -v
 git ls-files -z > /tmp/mto-publication-files
 "$MTO_PY" scripts/check_release.py --root "$MTO_DIR" --file-list /tmp/mto-publication-files
 ```
-
-Offline checks cover synthetic dataset/normalization, mocked two-stage annotation, actual flow-loss masks and gradients with controlled experts, checkpoint/optimizer/EMA continuation, W&B ID reuse and a stub WebSocket/simulator loop. They do not establish full-model GPU recovery, eight-GPU memory/convergence, real SAPIEN behavior or paper reproduction. See [deployment details](docs/lerobot_robotwin.md) and [release boundaries](docs/release.md).
+## Citation
+@article{xu2026move,
+  title={Move-Then-Operate: Behavioral Phasing for Human-Like Robotic Manipulation},
+  author={Xu, Haoming and Lei, Lei and Gu, Jie and Tang, Chu and Chen, Jingmin and Wang, Ruiqi},
+  journal={arXiv preprint arXiv:2604.23620},
+  year={2026}
+}
