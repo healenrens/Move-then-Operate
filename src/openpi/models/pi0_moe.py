@@ -87,6 +87,23 @@ class _DualExpertContext:
     route_labels: jax.Array | None
     route_ce: jax.Array
     expert_mse: jax.Array
+    valid_elements_per_sample: jax.Array
+
+
+def _routed_expert_metrics(context: _DualExpertContext) -> dict[str, jax.Array]:
+    """Report each expert's MSE on its ground-truth group of valid elements."""
+    metrics = {}
+    if context.route_labels is None:
+        return metrics
+    count = context.valid_elements_per_sample
+    inverse_scale = jnp.maximum(jnp.sum(count), 1.0) / context.flow_mse.size
+    for index in range(context.expert_mse.shape[-1]):
+        group = (context.route_labels == index).astype(jnp.float32)
+        group_count = jnp.sum(count * group)
+        error_sum = jnp.sum(context.expert_mse[..., index] * group[:, None]) * inverse_scale
+        metrics[f"loss_mse_expert{index}_masked"] = error_sum / jnp.maximum(group_count, 1.0)
+        metrics[f"valid_elements_expert{index}"] = group_count
+    return metrics
 
 
 class Pi0(_model.BaseModel):
@@ -442,6 +459,7 @@ class Pi0(_model.BaseModel):
             route_labels=route_labels,
             route_ce=route_ce,
             expert_mse=expert_mse,
+            valid_elements_per_sample=jnp.sum(combined_mask, axis=(1, 2)),
         )
         return context
 
@@ -482,6 +500,7 @@ class Pi0(_model.BaseModel):
         expert_mse = jnp.mean(context.expert_mse, axis=(0, 1))
         for idx, value in enumerate(expert_mse):
             metrics[f"loss_mse_expert{idx}"] = value
+        metrics.update(_routed_expert_metrics(context))
 
         metrics["route_pred_fraction"] = jnp.mean(context.predicted_route.astype(jnp.float32))
         metrics["route_selected_fraction"] = jnp.mean(context.selected_route.astype(jnp.float32))

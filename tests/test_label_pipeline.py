@@ -55,7 +55,8 @@ class LabelPipelineTest(unittest.TestCase):
 
         args = argparse.Namespace(data_format="lerobot", camera_key="observation.images.cam_high",
                                   sample_fps=5.0, max_frames=64, model_id="mock-model", base_url="http://localhost",
-                                  max_new_tokens=2048, max_attempts=3, concurrency=1, resume=True, api_key=None)
+                                  max_new_tokens=2048, max_attempts=3, concurrency=1, resume=True, api_key=None,
+                                  gripper_event_threshold=0.02, event_context_frames=2, mosaic_tile_size=8)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             dataset = root / "source/task_a/demo_clean"
@@ -92,7 +93,10 @@ class LabelPipelineTest(unittest.TestCase):
                 self.assertEqual(indexed_text, [f"frame_idx={index}" for index in indices])
                 if len(requests) == 1:
                     return httpx.Response(429, json={"error": {"message": "fixture rate limit", "type": "rate_limit"}})
-                self.assertIn("Previous attempt issues", user_content[-1]["text"])
+                if len(requests) <= 3:
+                    self.assertIn("Previous attempt issues", user_content[-1]["text"])
+                else:
+                    self.assertIn("Boundary calibration stage", user_content[-1]["text"])
                 text = "[invalid JSON]" if len(requests) == 2 else json.dumps(labels)
                 midpoint = len(text) // 2
                 return httpx.Response(200, json={
@@ -111,14 +115,14 @@ class LabelPipelineTest(unittest.TestCase):
             with patch.object(auto_label, "read_frame_at", side_effect=lambda _, index: (index, frame)), \
                     client, redirect_stdout(io.StringIO()):
                 result = auto_label.process_job(client, args, job, None)
-            self.assertEqual((result["status"], len(requests)), ("annotated", 3))
+            self.assertEqual((result["status"], len(requests)), ("annotated", 4))
             self.assertEqual(load_phase_labels(output, 720), (labels, None))
             self.assertIsNone(auto_label.existing_label_error(job))
             meta_path = label_metadata_path(output)
             saved_meta = json.loads(meta_path.read_text())
-            self.assertEqual(saved_meta["attempts"], 3)
+            self.assertEqual(saved_meta["attempts"], 4)
             self.assertEqual(saved_meta["model"]["api"], "responses")
-            for field in ("relative_id", "episode_index", "length", "fps", "camera", "instruction", "sampling", "source", "model"):
+            for field in ("relative_id", "episode_index", "length", "fps", "camera", "instruction", "sampling", "source", "model", "rule_version", "visual_layout", "temporal_evidence"):
                 mismatch = deepcopy(saved_meta)
                 mismatch[field] = "different"
                 meta_path.write_text(json.dumps(mismatch))
@@ -130,7 +134,7 @@ class LabelPipelineTest(unittest.TestCase):
             with patch.object(auto_label, "parse_args", return_value=args), \
                     patch.object(auto_label, "make_jobs", return_value=([job], None, [])), \
                     patch.object(auto_label, "create_client") as create_client, redirect_stdout(stdout):
-                auto_label.main()
+                self.assertEqual(auto_label.main(), 0)
             create_client.assert_not_called()
             summary = json.loads(stdout.getvalue()[stdout.getvalue().index("{"):])
             self.assertEqual((summary["valid_existing"], summary["annotated"], summary["complete"]), (1, 0, True))
@@ -145,6 +149,50 @@ class LabelPipelineTest(unittest.TestCase):
             self.assertFalse(label_metadata_path(other).exists())
             self.assertEqual(len(result["errors"]), 3)
 
+            corrected = deepcopy(labels)
+            corrected[0]["phases"][0]["end_frame_idx"] = 89
+            corrected[0]["phases"][1]["start_frame_idx"] = 90
+            self.assertEqual(auto_label.calibration_error(labels, corrected), "")
+            semantic_change = deepcopy(corrected)
+            semantic_change[0]["primary_arm"] = "right"
+            self.assertTrue(auto_label.calibration_error(labels, semantic_change))
+            with patch.object(auto_label, "read_frame_at", side_effect=lambda _, index: (index, frame)), \
+                    patch.object(auto_label, "run_inference", side_effect=[json.dumps(labels)] + [json.dumps(semantic_change)] * 3), \
+                    redirect_stdout(io.StringIO()):
+                result = auto_label.process_job(object(), args, failed_job, None)
+            self.assertEqual(result["status"], "failed")
+            self.assertFalse(other.exists())
+
+            import numpy as np
+            state = np.zeros((8, 14), dtype=np.float32)
+            state[2:5, 6] = [0.2, 0.4, 0.6]
+            state[5:, 6] = 0.6
+            state[5:, 13] = 1.0
+            events = auto_label.extract_gripper_events(state, 30, 0.02)
+            self.assertEqual([(event["arm"], event["start_frame_idx"], event["end_frame_idx"])
+                              for event in events], [("left", 1, 4), ("right", 4, 5)])
+            selected = auto_label.sample_event_frames(8, 30, 5, 6, events, 0)
+            self.assertTrue({0, 1, 4, 5, 7}.issubset(selected))
+            dense = [{"start_frame_idx": i, "end_frame_idx": i + 1} for i in range(719)]
+            selected = auto_label.sample_event_frames(720, 30, 5, 16, dense, 2)
+            self.assertEqual((selected[0], selected[-1], len(selected)), (0, 719, 16))
+            colors = [Image.new("RGB", (8, 8), color) for color in ("red", "green", "blue")]
+            mosaic = auto_label.make_camera_mosaic(colors, auto_label.CAMERA_KEYS, 8)
+            self.assertEqual(mosaic.size, (24, 32))
+            self.assertEqual([mosaic.getpixel((i * 8 + 4, 28)) for i in range(3)],
+                             [(255, 0, 0), (0, 128, 0), (0, 0, 255)])
+            episode_job = auto_label.AnnotationJob(other, deepcopy(metadata), indices, episode=object())
+            episode_job.metadata["visual_layout"]["cameras"] = list(auto_label.CAMERA_KEYS)
+            reader_views = SimpleNamespace(read_rgb=lambda ep, camera, frames: [colors[auto_label.CAMERA_KEYS.index(camera)]] * len(frames))
+            with patch.object(auto_label, "run_inference", side_effect=[json.dumps(labels), json.dumps(corrected)]) as infer, \
+                    redirect_stdout(io.StringIO()):
+                result = auto_label.process_job(object(), args, episode_job, reader_views)
+            self.assertEqual(result["status"], "annotated")
+            self.assertEqual(infer.call_count, 2)
+            self.assertEqual(json.loads(other.read_text()), corrected)
+            other.unlink()
+            label_metadata_path(other).unlink()
+
             stale_meta = {**saved_meta, "instruction": "A different episode instruction."}
             meta_path.write_text(json.dumps(stale_meta))
             args.api_key = "mock-key"
@@ -157,7 +205,7 @@ class LabelPipelineTest(unittest.TestCase):
                     patch.object(auto_label, "process_job", wraps=auto_label.process_job) as process, \
                     patch.object(auto_label, "run_inference", return_value="[{}]") as infer, \
                     redirect_stdout(stdout):
-                auto_label.main()
+                self.assertEqual(auto_label.main(), 1)
             summary = json.loads(stdout.getvalue()[stdout.getvalue().index("{\n"):])
             self.assertEqual((summary["invalid_labels_before"], summary["failed"], infer.call_count), (1, 1, 3))
             self.assertFalse(summary["complete"])

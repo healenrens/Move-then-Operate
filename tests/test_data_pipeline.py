@@ -4,6 +4,7 @@ Run with: .venv/bin/python -m unittest discover -s tests -p test_data_pipeline.p
 The MP4 fixture uses MPEG-4; production AV1 decoding needs the real-data check.
 """
 
+import argparse
 from fractions import Fraction
 import json
 from pathlib import Path
@@ -17,6 +18,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from mto import auto_label
 from mto.compute_norm_stats import compute_statistics
 from mto.dataset import CAMERAS, PhaseDataset, wide_camera_collate_fn
 from mto.labels import label_path, load_phase_labels
@@ -157,6 +159,23 @@ class DataPipelineIntegrationTest(unittest.TestCase):
             expected.update(_write_dataset(collection, labels_root, 1, 1))
             reader = LeRobotReader(collection)
             self.assertEqual([(ep.relative_id, ep.episode_index) for ep in reader.episodes], sorted(expected))
+            annotation_args = argparse.Namespace(root_dir=str(collection), labels_root=str(labels_root),
+                data_format="lerobot", task_names=(), split_names=("demo_clean",), videos_limit=-1,
+                camera_key="observation.images.cam_high", sample_fps=5, max_frames=8,
+                gripper_event_threshold=0.02, event_context_frames=2, mosaic_tile_size=8,
+                model_id="fixture-model", base_url="http://localhost", max_new_tokens=2048)
+            annotation_jobs, annotation_reader, errors = auto_label.make_jobs(annotation_args)
+            self.assertFalse(errors)
+            self.assertEqual(len(annotation_jobs), 4)
+            for job in annotation_jobs:
+                self.assertEqual(job.metadata["rule_version"], auto_label.RULE_VERSION)
+                self.assertEqual(job.metadata["visual_layout"]["cameras"], list(auto_label.CAMERA_KEYS))
+                self.assertEqual(job.metadata["temporal_evidence"]["method"], "measured_gripper_changes")
+                self.assertEqual((job.frame_indices[0], job.frame_indices[-1]), (0, LENGTH - 1))
+                self.assertLessEqual(len(job.frame_indices), 8)
+                self.assertTrue(job.metadata["temporal_evidence"]["events"])
+                for camera in auto_label.CAMERA_KEYS:
+                    self.assertEqual(len(annotation_reader.read_rgb(job.episode, camera, job.frame_indices)), len(job.frame_indices))
             single_root = collection / "task_0/demo_clean"
             self.assertEqual([ep.relative_id for ep in list_episodes(single_root)], ["task_0/demo_clean"] * 3)
             self.assertEqual(len(list_episodes(collection / "task_0", split_names=("demo_clean",))), 3)
@@ -266,7 +285,7 @@ class DataPipelineIntegrationTest(unittest.TestCase):
             np.testing.assert_array_equal(observation.route_labels, [0, 1])
             np.testing.assert_array_equal(observation.action_loss_mask, batch["action_mask"].numpy())
             np.testing.assert_array_equal(observation.action_dim_mask[:, :14], True)
-            np.testing.assert_array_equal(observation.action_dim_mask[:, 14:], False)
+            np.testing.assert_array_equal(observation.action_dim_mask[:, 14:], True)
             np.testing.assert_array_equal(actions[:, :, 14:], 0)
             np.testing.assert_array_equal(observation.state[:, 14:], 0)
             for image in observation.images.values():

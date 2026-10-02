@@ -66,7 +66,7 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = 
     if not ckpt_dir.exists():
         raise FileNotFoundError(f"Checkpoint directory {ckpt_dir} does not exist.")
     run_id_path = ckpt_dir / "wandb_id.txt"
-    if resuming and run_id_path.exists():
+    if (resuming or config.resume) and run_id_path.exists():
         run_id = run_id_path.read_text().strip()
         wandb.init(id=run_id, resume="must", project=config.project_name)
     else:
@@ -266,27 +266,9 @@ def train_step(
         expert0_mask = (selected_route == 0)
         expert1_mask = (selected_route == 1)
 
-        valid_elements = jnp.ones(actions.shape, dtype=jnp.float32)
-        if observation.action_loss_mask is not None:
-            valid_elements *= observation.action_loss_mask[..., None]
-        if observation.action_dim_mask is not None:
-            dim_mask = observation.action_dim_mask
-            if dim_mask.ndim == 2:
-                dim_mask = dim_mask[:, None, :]
-            valid_elements *= dim_mask
-        valid_per_example = jnp.sum(valid_elements, axis=(1, 2))
-        # expert_mse uses B*H / total_valid scaling; undo it before applying
-        # each route group's own valid-element denominator.
-        inverse_loss_scale = jnp.sum(valid_per_example) / (actions.shape[0] * actions.shape[1])
+        from openpi.models.pi0_moe import _routed_expert_metrics
 
-        def _routed_element_mse(expert_index, route_mask):
-            route_mask = route_mask.astype(jnp.float32)
-            group_sse = jnp.sum(context.expert_mse[..., expert_index] * route_mask[:, None]) * inverse_loss_scale
-            group_count = jnp.sum(valid_per_example * route_mask)
-            return group_sse / jnp.maximum(group_count, 1.0)
-
-        diag_metrics["loss_mse_expert0_masked"] = _routed_element_mse(0, expert0_mask)
-        diag_metrics["loss_mse_expert1_masked"] = _routed_element_mse(1, expert1_mask)
+        diag_metrics.update(_routed_expert_metrics(context))
 
         diag_metrics["route_selected_fraction_0"] = jnp.mean(expert0_mask.astype(jnp.float32))
         diag_metrics["route_selected_fraction_1"] = jnp.mean(expert1_mask.astype(jnp.float32))

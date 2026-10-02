@@ -25,3 +25,25 @@ qpos*_normalization_stats*.json
 
 eval_results/
 mto_traces/
+venv/
+env/
+.venv*/
+.cache/
+.mypy_cache/
+.coverage
+htmlcov/
+*.pem
+*.key
+*credentials*.json
+artifacts/
+runtime/
+labels/
+auto_labels_v2/
+*_phases_raw.txt
+*_phases_error.txt
+*.npy
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+*.tar.gz

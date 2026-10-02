@@ -179,7 +179,8 @@ def _pad_action_dim_mask(mask: np.ndarray | None, target_dim: int) -> np.ndarray
     if mask.shape[-1] >= target_dim:
         return mask[..., :target_dim]
     pad_shape = mask.shape[:-1] + (target_dim - mask.shape[-1],)
-    return np.concatenate([mask, np.zeros(pad_shape, dtype=bool)], axis=-1)
+    # Zero actions in the added model dimensions are supervised on valid rows.
+    return np.concatenate([mask, np.ones(pad_shape, dtype=bool)], axis=-1)
 
 
 def _build_observation_and_actions(
@@ -400,6 +401,9 @@ def main(cfg: WideCameraTrainConfig) -> None:
 
     if resuming:
         train_state = _checkpoints.restore_state(checkpoint_manager, train_state)
+        logging.info("Restored checkpoint at step %d", int(train_state.step))
+    else:
+        logging.info("Starting a new training state at step 0")
 
     ptrain_step = jax.jit(
         functools.partial(base_train_step, train_config),

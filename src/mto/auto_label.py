@@ -12,17 +12,33 @@ from datetime import datetime, timezone
 import json
 import math
 import os
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, Tuple
 
 import cv2
 from openai import APIConnectionError, APIStatusError, OpenAI
-from PIL import Image
+import numpy as np
+from PIL import Image, ImageDraw
 
 from mto.labels import label_metadata_path, label_path, load_phase_labels, validate_phase_labels
 
 if TYPE_CHECKING:
     from mto.lerobot_reader import EpisodeRef, LeRobotReader
+    from mto.dataset import Hdf5Episode, Hdf5Reader
+
+
+RULE_VERSION = "move_operate_alignment_v6"
+CAMERA_KEYS = ("observation.images.cam_high", "observation.images.cam_left_wrist",
+               "observation.images.cam_right_wrist")
+PHASE_RULES = """MOVE means coarse travel, ordinary carrying, and withdrawal.
+OPERATE includes target-relative fine alignment before grasp, the final controlled
+approach, the entire grasp/release action, and object repositioning. Start OPERATE
+at the first visible fine alignment, not only at the gripper closing frame.
+An empty gripper opening or closing in preparation is not evidence of object
+contact. Combine the visual target relation with measured gripper changes.
+A measured gripper event is motion evidence, not a contact sensor.
+"""
 
 
 @dataclass
@@ -38,7 +54,7 @@ class AnnotationJob:
     metadata: dict
     frame_indices: list[int]
     video_path: str | None = None
-    episode: EpisodeRef | None = None
+    episode: EpisodeRef | Hdf5Episode | None = None
 
     @property
     def identity(self) -> str:
@@ -53,12 +69,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output_dir", help="Legacy standalone-video output directory; use labels_root for LeRobot.")
     parser.add_argument("--task_names", nargs="*", default=())
     parser.add_argument("--split_names", nargs="*", default=())
-    parser.add_argument("--camera_key", help="Defaults to observation.images.cam_high for LeRobot, head_camera for standalone videos.")
-    parser.add_argument("--model_id", default="ep-20260605100618-g5rhc")
+    parser.add_argument("--camera_key", help="Legacy standalone-video camera label. Structured episodes use head/left/right cameras.")
+    parser.add_argument("--model_id", default=os.environ.get("ARK_MODEL_ID"))
     parser.add_argument("--api_key", help="Defaults to the ARK_API_KEY environment variable.")
-    parser.add_argument("--base_url", default="https://ark.cn-beijing.volces.com/api/v3")
+    parser.add_argument("--base_url", default=os.environ.get("ARK_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3"))
     parser.add_argument("--sample_fps", type=float, default=5.0)
     parser.add_argument("--max_frames", type=int, default=64)
+    parser.add_argument("--gripper_event_threshold", type=float, default=0.02,
+                        help="Minimum absolute per-frame gripper change in recorded units.")
+    parser.add_argument("--event_context_frames", type=int, default=2)
+    parser.add_argument("--mosaic_tile_size", type=int, default=320)
     parser.add_argument("--videos_limit", type=int, default=-1)
     parser.add_argument("--max_new_tokens", type=int, default=8192,
                         help="Responses max_output_tokens, including thinking and final label JSON.")
@@ -67,6 +87,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no_resume", dest="resume", action="store_false")
     parser.set_defaults(resume=True)
     args = parser.parse_args()
+    if not args.model_id:
+        parser.error("Set ARK_MODEL_ID or pass --model_id.")
     if args.max_frames < 2 or args.sample_fps <= 0:
         parser.error("max_frames must be at least 2 and sample_fps must be positive.")
     if args.max_attempts < 1 or args.concurrency < 1:
@@ -149,6 +171,92 @@ def sample_frame_indices(length: int, fps: float, sample_fps: float, max_frames:
     return [round(position * (length - 1) / (count - 1)) for position in range(count)]
 
 
+def extract_gripper_events(state: np.ndarray, fps: float, threshold: float) -> list[dict]:
+    """Group consecutive measured gripper changes; do not infer object contact."""
+    events = []
+    for arm, column in (("left", 6), ("right", 13)):
+        values = state[:, column]
+        delta = np.diff(values)
+        active = np.flatnonzero(np.abs(delta) >= threshold)
+        breaks = (np.diff(active) != 1) | (np.sign(delta[active[1:]]) != np.sign(delta[active[:-1]]))
+        groups = np.split(active, np.flatnonzero(breaks) + 1)
+        for group in groups:
+            if not len(group):
+                continue
+            start, end = int(group[0]), int(group[-1]) + 1
+            events.append({"arm": arm, "start_frame_idx": start, "end_frame_idx": end,
+                           "start_seconds": start / fps, "end_seconds": end / fps,
+                           "before": float(values[start]), "after": float(values[end]),
+                           "motion": "increasing" if values[end] > values[start] else "decreasing"})
+    return sorted(events, key=lambda event: (event["start_frame_idx"], event["arm"]))
+
+
+def sample_event_frames(length, fps, sample_fps, max_frames, events, context_frames):
+    """Prioritize endpoints and event anchors within a fixed full-episode budget."""
+    selected = {0, length - 1}
+    anchors = sorted({frame for event in events
+                      for frame in (event["start_frame_idx"], event["end_frame_idx"])
+                      if frame not in selected})
+    room = max_frames - len(selected)
+    if len(anchors) > room:
+        anchors = [anchors[index] for index in np.linspace(0, len(anchors) - 1, room, dtype=int)] if room else []
+    selected.update(anchors)
+    context = sorted({max(0, min(length - 1, frame + offset)) for frame in anchors
+                      for offset in (-context_frames, context_frames)} - selected)
+    room = max_frames - len(selected)
+    if len(context) > room:
+        context = [context[index] for index in np.linspace(0, len(context) - 1, room, dtype=int)] if room else []
+    selected.update(context)
+    uniform = [frame for frame in sample_frame_indices(length, fps, sample_fps, max_frames)
+               if frame not in selected]
+    room = max_frames - len(selected)
+    if len(uniform) > room:
+        uniform = [uniform[index] for index in np.linspace(0, len(uniform) - 1, room, dtype=int)] if room else []
+    return sorted(selected.union(uniform))
+
+
+def make_camera_mosaic(images: list[Image.Image], camera_keys, tile_size: int) -> Image.Image:
+    """Lay out synchronized head, left wrist, and right wrist observations."""
+    mosaic = Image.new("RGB", (tile_size * len(images), tile_size + 24))
+    draw = ImageDraw.Draw(mosaic)
+    for index, (image, key) in enumerate(zip(images, camera_keys, strict=True)):
+        mosaic.paste(image.convert("RGB").resize((tile_size, tile_size)), (index * tile_size, 24))
+        draw.text((index * tile_size + 4, 4), key.removeprefix("observation.images."), fill="white")
+    return mosaic
+
+
+def build_calibration_messages(instruction, total_frames, samples, fps, draft, evidence, visual_layout=None):
+    messages = build_messages(instruction, total_frames, samples, fps, visual_layout)
+    messages[-1]["content"].append({"type": "input_text", "text": (
+        "Boundary calibration stage. Use the measured gripper timeline and the synchronized images "
+        "to correct guessed temporal boundaries, including the start of fine alignment. "
+        "Measured changes may represent empty-gripper preparation; do not equate them with contact. "
+        "Preserve exactly the draft's subtask count and order, phase counts, phase types/order, "
+        "primary arms, descriptions, object names, and coordinates. Change only start_frame_idx "
+        "and end_frame_idx, keeping full inclusive coverage. Return the complete calibrated JSON array."
+        + "\nMeasured temporal evidence: " + json.dumps(evidence)
+        + "\nVisual draft: " + json.dumps(draft))})
+    return messages
+
+
+def calibration_error(draft, calibrated) -> str:
+    """Calibration can move boundaries, but cannot rewrite the semantic draft."""
+    def semantics(labels):
+        return [{key: ([{k: v for k, v in phase.items() if k not in ("start_frame_idx", "end_frame_idx")}
+                       for phase in value] if key == "phases" else value)
+                 for key, value in subtask.items() if key not in ("start_frame_idx", "end_frame_idx")}
+                for subtask in labels]
+    return "Calibration changed the draft's structure or semantics." if semantics(draft) != semantics(calibrated) else ""
+
+
+def redact_error(text: str, client) -> str:
+    keys = [getattr(client, "api_key", None)]
+    keys.extend(os.environ.get(name) for name in ("ARK_API_KEY", "WANDB_API_KEY", "OPENAI_API_KEY"))
+    for key in sorted({key for key in keys if isinstance(key, str) and key}, key=len, reverse=True):
+        text = text.replace(key, "[REDACTED]")
+    return text
+
+
 def sample_video_frames(video_path: str, desired_sample_fps: float, max_frames: int) -> List[Tuple[int, Image.Image]]:
     fps, length = get_video_info(video_path)
     return [read_frame_at(video_path, index) for index in sample_frame_indices(length, fps, desired_sample_fps, max_frames)]
@@ -168,10 +276,12 @@ def build_messages(
     total_frames: int,
     samples: List[Tuple[int, Image.Image]],
     fps: float,
+    visual_layout: dict | None = None,
 ) -> List[Dict[str, object]]:
     frame_list_text = ", ".join(str(idx) for idx, _ in samples)
     prompt = (
         "You are an expert robotic manipulation annotator.\n"
+        + f"Annotation rule: {RULE_VERSION}.\n" + PHASE_RULES + "\n"
         "Instruction: "
         + instruction
         + "\n"
@@ -228,6 +338,12 @@ def build_messages(
 
     content: List[Dict[str, object]] = [{"type": "input_text", "text": "Frame indices: " + frame_list_text}]
     content.append({"type": "input_text", "text": prompt})
+    if visual_layout is not None:
+        content.append({"type": "input_text", "text": (
+            "Visual layout: " + json.dumps(visual_layout)
+            + ". Each mosaic contains views at the SAME episode frame; tiles are ordered left to right "
+              "as listed in cameras. Object/gripper coordinates refer to the first camera tile, "
+              "normalized within that tile, excluding its header.")})
     for idx, image in samples:
         content.append({"type": "input_text", "text": f"frame_idx={idx}"})
         content.append(
@@ -374,20 +490,31 @@ def resolve_api_key(explicit: str | None) -> str:
 
 
 def build_metadata(args: argparse.Namespace, relative_id: str, episode_index: int | str,
-                   length: int, fps: float, instruction: str, source: dict) -> dict:
-    indices = sample_frame_indices(length, fps, args.sample_fps, args.max_frames)
+                   length: int, fps: float, instruction: str, source: dict,
+                   events: list[dict] | None = None, cameras: tuple[str, ...] | None = None) -> dict:
+    cameras = cameras if cameras is not None else (args.camera_key,)
+    events = events if events is not None else []
+    indices = sample_event_frames(length, fps, args.sample_fps, args.max_frames, events,
+                                  args.event_context_frames)
     return {
+        "rule_version": RULE_VERSION,
+        "stages": ["visual_draft", "boundary_calibration"],
+        "visual_layout": {"method": "same_frame_three_camera_mosaic" if len(cameras) == 3 else "single_camera",
+                          "cameras": list(cameras), "tile_size": args.mosaic_tile_size},
+        "temporal_evidence": {"method": "measured_gripper_changes" if source.get("data_format") in ("lerobot_v3", "hdf5") else "visual_only",
+                              "gripper_event_threshold": args.gripper_event_threshold,
+                              "event_context_frames": args.event_context_frames, "events": events},
         "relative_id": relative_id,
         "episode_index": episode_index,
         "length": length,
         "fps": fps,
-        "camera": args.camera_key,
+        "camera": cameras[0],
         "instruction": instruction,
         "frame_space": "episode_local",
         "end_convention": "inclusive",
         "model": {"id": args.model_id, "base_url": args.base_url, "api": "responses",
                   "max_new_tokens": args.max_new_tokens},
-        "sampling": {"method": "uniform_full_episode", "sample_fps": args.sample_fps,
+        "sampling": {"method": "event_anchors_and_uniform_full_episode", "sample_fps": args.sample_fps,
                      "max_frames": args.max_frames, "frame_indices": indices},
         "source": source,
     }
@@ -408,6 +535,10 @@ def existing_label_error(job: AnnotationJob) -> str | None:
         return f"Cannot read metadata {metadata_path}: {error}"
     if not isinstance(metadata, dict):
         return "Label metadata must be an object."
+    stage_attempts = metadata.get("stage_attempts", {})
+    if any(type(stage_attempts.get(stage)) is not int or stage_attempts[stage] < 1
+           for stage in ("visual_draft", "boundary_calibration")):
+        return "Label metadata must record successful attempts for both stages."
     for key, expected in job.metadata.items():
         if metadata.get(key) != expected:
             return f"Label metadata mismatch for {key}."
@@ -428,7 +559,7 @@ def archive_invalid_labels(path: Path) -> list[str]:
     return archived
 
 
-def make_jobs(args: argparse.Namespace) -> tuple[list[AnnotationJob], LeRobotReader | None, list[dict]]:
+def make_jobs(args: argparse.Namespace) -> tuple[list[AnnotationJob], LeRobotReader | Hdf5Reader | None, list[dict]]:
     root = Path(args.root_dir).expanduser().resolve()
     labels_root = Path(args.labels_root).expanduser().resolve() if args.labels_root else None
     jobs, failures = [], []
@@ -447,14 +578,20 @@ def make_jobs(args: argparse.Namespace) -> tuple[list[AnnotationJob], LeRobotRea
                 "episode_metadata": {
                     key: value for key, value in episode.metadata.items()
                     if key in ("dataset_from_index", "dataset_to_index", "data/chunk_index", "data/file_index")
-                    or key.startswith(f"videos/{args.camera_key}/")
+                    or any(key.startswith(f"videos/{camera}/") for camera in CAMERA_KEYS)
                 },
             }
+            events = extract_gripper_events(reader.read_rows(episode)["observation.state"],
+                                            episode.fps, args.gripper_event_threshold)
             metadata = build_metadata(args, episode.relative_id, episode.episode_index,
-                                      episode.length, episode.fps, instruction, source)
+                                      episode.length, episode.fps, instruction, source, events, CAMERA_KEYS)
             jobs.append(AnnotationJob(output, metadata, metadata["sampling"]["frame_indices"], episode=episode))
         return jobs, reader, failures
 
+    from mto.dataset import Hdf5Reader
+
+    reader = Hdf5Reader(root)
+    hdf5_episodes = {f"episode{ep.episode_index}": ep for ep in reader.episodes if ep.dataset_root == root}
     relative_id = f"{root.parent.name}/{root.name}"
     output_dir = Path(args.output_dir) if args.output_dir else (
         (labels_root / relative_id if labels_root else root) / "auto_labels_v2"
@@ -476,41 +613,70 @@ def make_jobs(args: argparse.Namespace) -> tuple[list[AnnotationJob], LeRobotRea
         source = {"data_format": "hdf5_video", "dataset_root": str(root), "video_path": str(video),
                   "instruction_path": sample.instruction_path, "video_size": stat.st_size,
                   "video_mtime_ns": stat.st_mtime_ns}
-        metadata = build_metadata(args, relative_id, episode_index, length, fps, instruction, source)
+        episode = hdf5_episodes.get(video.stem)
+        events, cameras = [], (args.camera_key,)
+        if episode is not None:
+            events = extract_gripper_events(reader.read_rows(episode)["observation.state"], fps,
+                                            args.gripper_event_threshold)
+            cameras = CAMERA_KEYS
+            source.update(data_format="hdf5", hdf5_path=str(episode.path),
+                          hdf5_mtime_ns=episode.path.stat().st_mtime_ns)
+        metadata = build_metadata(args, relative_id, episode_index, length, fps, instruction, source, events, cameras)
         jobs.append(AnnotationJob(Path(sample.output_path), metadata, metadata["sampling"]["frame_indices"],
-                                  video_path=sample.video_path))
-    return jobs, None, failures
+                                  video_path=sample.video_path, episode=episode))
+    return jobs, reader, failures
 
 
 def process_job(client: OpenAI, args: argparse.Namespace, job: AnnotationJob,
-                reader: LeRobotReader | None) -> dict:
+                reader: LeRobotReader | Hdf5Reader | None) -> dict:
     if job.episode is not None:
-        images = reader.read_rgb(job.episode, args.camera_key, job.frame_indices)
-        samples = list(zip(job.frame_indices, images, strict=True))
+        cameras = job.metadata["visual_layout"]["cameras"]
+        views = [reader.read_rgb(job.episode, camera, job.frame_indices) for camera in cameras]
+        samples = [(index, make_camera_mosaic(list(images), cameras, args.mosaic_tile_size))
+                   for index, images in zip(job.frame_indices, zip(*views, strict=True), strict=True)]
     else:
         samples = [read_frame_at(job.video_path, index) for index in job.frame_indices]
-    base_messages = build_messages(job.metadata["instruction"], job.metadata["length"], samples, job.metadata["fps"])
-    feedbacks, final_raw, validated = [], "", []
-    for attempt in range(1, args.max_attempts + 1):
-        messages = compose_messages_with_feedback(base_messages, feedbacks)
-        try:
-            final_raw = run_inference(client, args.model_id, messages, args.max_new_tokens)
-            parsed = extract_json_array(final_raw)
-            validated, error = validate_subtasks(parsed, job.metadata["length"])
-        except (APIConnectionError, APIStatusError, json.JSONDecodeError, ValueError, KeyError, TypeError, IndexError) as exception:
-            error = f"{type(exception).__name__}: {exception}"
-        if not error:
-            break
-        feedbacks.append(error)
-        print(f"[retry] {job.identity} attempt {attempt}/{args.max_attempts}: {error}")
+
+    def run_stage(name, base_messages, draft=None):
+        feedbacks, final_raw = [], ""
+        for attempt in range(1, args.max_attempts + 1):
+            messages = compose_messages_with_feedback(base_messages, feedbacks)
+            try:
+                final_raw = redact_error(run_inference(client, args.model_id, messages, args.max_new_tokens), client)
+                parsed = extract_json_array(final_raw)
+                validated, error = validate_subtasks(parsed, job.metadata["length"])
+                if not error and draft is not None:
+                    error = calibration_error(draft, validated)
+            except (APIConnectionError, APIStatusError, json.JSONDecodeError, ValueError, KeyError, TypeError, IndexError) as exception:
+                error = redact_error(f"{type(exception).__name__}: {exception}", client)
+            if not error:
+                return validated, attempt, feedbacks, final_raw
+            feedbacks.append(error)
+            print(f"[retry] {job.identity} {name} attempt {attempt}/{args.max_attempts}: {error}")
+        return [], attempt, feedbacks, final_raw
+
+    draft_messages = build_messages(job.metadata["instruction"], job.metadata["length"], samples,
+                                    job.metadata["fps"], job.metadata["visual_layout"])
+    draft, draft_attempts, errors, draft_raw = run_stage("visual_draft", draft_messages)
+    validated, calibration_attempts, calibration_raw = [], 0, ""
+    if draft:
+        calibration_messages = build_calibration_messages(
+            job.metadata["instruction"], job.metadata["length"], samples, job.metadata["fps"], draft,
+            job.metadata["temporal_evidence"], job.metadata["visual_layout"])
+        validated, calibration_attempts, calibration_errors, calibration_raw = run_stage(
+            "boundary_calibration", calibration_messages, draft)
+        errors += calibration_errors
     job.output_path.parent.mkdir(parents=True, exist_ok=True)
-    Path(sidecar_path(str(job.output_path), "_phases_raw.txt")).write_text(final_raw, encoding="utf-8")
+    Path(sidecar_path(str(job.output_path), "_phases_raw.txt")).write_text(
+        "Visual draft:\n" + draft_raw + "\nBoundary calibration:\n" + calibration_raw, encoding="utf-8")
     error_path = Path(sidecar_path(str(job.output_path), "_phases_error.txt"))
     if not validated:
-        error_path.write_text("\n".join(feedbacks), encoding="utf-8")
-        return {"identity": job.identity, "path": str(job.output_path), "status": "failed", "errors": feedbacks}
+        error_path.write_text("\n".join(errors), encoding="utf-8")
+        return {"identity": job.identity, "path": str(job.output_path), "status": "failed", "errors": errors}
     job.output_path.write_text(json.dumps(validated, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    metadata = {**job.metadata, "created_at": datetime.now(timezone.utc).isoformat(), "attempts": attempt}
+    metadata = {**job.metadata, "created_at": datetime.now(timezone.utc).isoformat(),
+                "attempts": draft_attempts + calibration_attempts,
+                "stage_attempts": {"visual_draft": draft_attempts, "boundary_calibration": calibration_attempts}}
     label_metadata_path(job.output_path).write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     if error_path.exists():
         error_path.unlink()
@@ -518,7 +684,7 @@ def process_job(client: OpenAI, args: argparse.Namespace, job: AnnotationJob,
     return {"identity": job.identity, "path": str(job.output_path), "status": "annotated"}
 
 
-def main() -> None:
+def main() -> int:
     args = parse_args()
     jobs, reader, source_errors = make_jobs(args)
     summary = {"selected": len(jobs) + len(source_errors), "valid_existing": 0,
@@ -562,7 +728,8 @@ def main() -> None:
                     summary["failures"].append(result)
     summary["complete"] = summary["selected"] > 0 and summary["failed"] == 0
     print(json.dumps(summary, ensure_ascii=False, indent=2))
+    return 0 if summary["complete"] else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

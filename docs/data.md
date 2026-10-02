@@ -27,7 +27,11 @@ Local labels live at `DATA_ROOT/task/split/auto_labels_v2/episodeN_phases_labels
 
 Labels are arrays of subtasks with integer `start_frame_idx`, `end_frame_idx`, and a `phases` array. Each phase has `phase_type` equal to `move` or `operate` and the same two bounds. Bounds are **inclusive episode-local state frames**. Subtasks must cover the complete episode consecutively, and phases must cover their subtask consecutively, without gaps or overlaps. A pure-operate subtask is valid. A one-state phase is valid annotation but contributes no action chunks. The loader reports missing/invalid labels and single-state phases in `data_manifest.json`; inspect these counts before considering the selected collection fully labeled.
 
-Auto-labeling samples uniformly over the **whole episode**, includes the endpoints, and respects both target FPS and the maximum frame count. Resume requires valid label content and matching sidecar metadata, not just a nonempty file. A missing or incompatible sidecar causes re-annotation. Training accepts structurally valid existing labels without requiring a sidecar. API/JSON failures get bounded retries; invalid coverage is never repaired with invented phases. Task instructions are the training language inputs; generated descriptions and future observations are not model inputs.
+Auto-labeling uses rule `move_operate_alignment_v6`. OPERATE includes target-relative fine alignment before grasp, the final controlled approach, full grasp/release and object repositioning. MOVE covers coarse travel, ordinary carrying and withdrawal. Empty-gripper preparation is not evidence of contact.
+
+Sampling prioritizes endpoints and measured gripper-event anchors, adds nearby context and uniform full-episode coverage, and respects the frame budget. LeRobot and available HDF5 observations form synchronized head/left-wrist/right-wrist mosaics. Standalone videos without state/camera data use a single view and explicitly record visual-only temporal evidence. The first API stage generates a visual draft; the second calibrates boundaries using measured gripper timing. It can change frame boundaries but preserves all subtask/phase counts, phase types/order, primary arms and semantic fields. Only a successful calibrated annotation is published. Each stage has its own bounded retry budget; failed jobs or zero selected episodes return exit code 1.
+
+Resume requires valid labels and matching metadata: source identity, rule version, visual layout, temporal evidence, model, sampling and successful stage-attempt metadata. Missing or incompatible sidecars cause archival and re-annotation. Training accepts structurally valid labels without requiring sidecars. Thread workers use independent reader caches. API failures are redacted before feedback/error output. Task instructions are training language inputs; generated descriptions and future observations are not model inputs.
 
 ## Action windows and normalization
 
@@ -37,7 +41,7 @@ For a phase spanning states `[a,b]`, sample anchor `a <= s < b` and set `n = min
 - HDF5 absolute targets: `state[s+1:s+n+1]`.
 - Subtract `state[s]` from target dimensions `[0,1,2,3,4,5,7,8,9,10,11,12]`.
 - Leave grippers 6 and 13 absolute. Zero-valued absolute targets are valid data.
-- Pad to `H` and mask padded rows out of the loss. Only the 14 physical dimensions contribute; padding to model dimension 32 is masked too.
+- Pad to `H` and mask padded rows out of the loss. Normalize the 14 physical dimensions with the labeled expert, then pad to model dimension 32 with zero actions. All 32 dimensions contribute on valid timesteps; the extra 18 dimensions have flow velocity target `noise - 0`. Time padding remains excluded. The action loss divides by the total valid action-element count; router cross-entropy is averaged independently over samples.
 
 Move is route 0; operate is route 1. With both present, the default sampler chooses each with probability 0.5, then chooses a phase uniformly within that expert and an anchor uniformly in its valid interval. Phases can yield short chunks near their ends. The boundary-crossing transition is excluded. There is no implicit action filtering or time compression. Optional `--drop-small-action-deltas` excludes near-stationary rows from loss/statistics while preserving their time slots. If every row in a training batch is excluded, flow loss is zero and router supervision remains. A selected expert must still have valid action rows for statistics estimation.
 
@@ -63,4 +67,4 @@ python -m mto.prepare_data --root-dir /data/mto/task/demo_clean --fps 30 --camer
 
 Use the real recording FPS. Annotate these videos with `mto.auto_label --data_format hdf5 --root_dir /data/mto/task/demo_clean`. Statistics and training then use `--data-format hdf5`, with the same two normalization files and phase-window contract.
 
-See [the run guide](lerobot_robotwin.md) for environment setup and commands.
+See [the README](../README.md) for environment setup and commands.
