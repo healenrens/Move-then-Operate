@@ -183,10 +183,17 @@ git ls-files -z > /tmp/mto-publication-files
 ```
 ## Citation
 ```
-@article{xu2026move,
-  title={Move-Then-Operate: Behavioral Phasing for Human-Like Robotic Manipulation},
-  author={Xu, Haoming and Lei, Lei and Gu, Jie and Tang, Chu and Chen, Jingmin and Wang, Ruiqi},
-  journal={arXiv preprint arXiv:2604.23620},
-  year={2026}
+@InProceedings{pmlr-v306-xu26aa,
+  title     = {Move-Then-Operate: Behavioral Phasing for Human-Like Robotic Manipulation},
+  author    = {Xu, Haoming and Lei, Lei and Gu, Jie and Tang, Chu and Chen, Jingmin and Wang, Rui-Qi},
+  booktitle = {Proceedings of the 43rd International Conference on Machine Learning},
+  pages     = {141250--141264},
+  year      = {2026},
+  editor    = {Zhang, Tong and Dudik, Miroslav and Jaggi, Martin and Agarwal, Alekh and Li, Sharon and Schuurmans, Dale and Zhu, Jerry and Berkenkamp, Felix and Dong, Hanze and Bietti, Alberto},
+  volume    = {306},
+  series    = {Proceedings of Machine Learning Research},
+  month     = {06--11 Jul},
+  publisher = {PMLR},
+  url       = {https://proceedings.mlr.press/v306/xu26aa.html}
 }
 ```
