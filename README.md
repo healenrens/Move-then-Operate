@@ -1,4 +1,14 @@
-# Move-then-Operate
+<p align="center">
+  <a href="https://arxiv.org/abs/2604.23620"><strong>arXiv: 2604.23620</strong></a>
+  &nbsp; | &nbsp;
+  <a href="https://proceedings.mlr.press/v306/xu26aa.html"><strong>ICML 2026 / PMLR</strong></a>
+</p>
+
+<h1 align="center">
+  <img src="assets/move-then-operate-logo.png" alt="Move-Then-Operate: Behavioral Phasing for Human-Like Robotic Manipulation" width="820">
+</h1>
+
+Official implementation of **[Move-Then-Operate: Behavioral Phasing for Human-Like Robotic Manipulation](https://arxiv.org/abs/2604.23620)** (ICML 2026).
 
 Move-then-Operate (MTO) is a hard-switch dual-expert vision-language-action policy built on [OpenPI](https://github.com/Physical-Intelligence/openpi). A shared vision-language model predicts MOVE or OPERATE; inference runs one selected action expert for the entire action chunk. MOVE and OPERATE use **separate normalization statistics**.
 
